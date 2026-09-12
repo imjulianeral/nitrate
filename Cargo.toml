@@ -1,0 +1,19 @@
+[package]
+name = "nitrate"
+version = "1.0.0"
+edition = "2021"
+description = "NITRATE — tactical video extraction console"
+license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/scrtx/video-tools"
+
+[dependencies]
+crossterm = "0.29"
+dirs = "6"
+ratatui = "0.30.2"
+serde_json = "1"
+unicode-width = "0.2"
+
+[[bin]]
+name = "nitrate"
+path = "src/main.rs"
