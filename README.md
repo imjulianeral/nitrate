@@ -123,6 +123,23 @@ nitrate help
 
 You can set `YT_DLP` and `FFMPEG` to force a program path. If you do not set these, NITRATE uses the bundled programs in `tools` next to the binary.
 
+## Cut a release
+
+A GitHub Release starts when you push a tag that matches `v*.*.*`.
+
+The tree must be clean. Then run:
+
+```sh
+./release.sh minor
+git push origin HEAD --tags
+```
+
+If you want a patch bump or a major bump, pass `patch` or `major`.
+
+The script writes the new version to `Cargo.toml` and `Cargo.lock`. Then it creates a commit and a tag. You do not need cargo-edit.
+
+`./release.sh minor --push` also pushes the commit and the tag.
+
 ## License
 
 MIT
