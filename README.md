@@ -6,15 +6,15 @@ Repository: <https://github.com/imjulianeral/nitrate>
 
 ## Requirements
 
-These programs must be on `PATH`:
+The installer and the GitHub Release archives include `yt-dlp`, `ffmpeg`, and `ffprobe`. You do not install these programs yourself.
 
-- `yt-dlp`
-- `ffmpeg`
-- `curl` (the installer and `nitrate update` use curl)
+`curl` is required for the installer and for `nitrate update`.
+
+If you build from source, a release build downloads the same programs into `target/release/tools`.
 
 ## Install
 
-The installer writes the `nitrate` binary for your OS and CPU.
+The installer writes the `nitrate` binary and a `tools` directory for your OS and CPU.
 
 ### Linux and macOS
 
@@ -24,7 +24,7 @@ Run:
 curl -fsSL https://github.com/imjulianeral/nitrate/releases/latest/download/install.sh | sh
 ```
 
-If `/usr/local/bin` is writable, the script writes the binary there. If it is not writable, the script writes to `~/.local/bin`.
+If `/usr/local/bin` is writable, the script writes the files there. If it is not writable, the script writes to `~/.local/bin`.
 
 If the install directory is not on `PATH`, add it.
 
@@ -38,39 +38,48 @@ In PowerShell, run:
 irm https://github.com/imjulianeral/nitrate/releases/latest/download/install.ps1 | iex
 ```
 
-The script writes `nitrate.exe` to `%LOCALAPPDATA%\nitrate`. Then it adds that directory to the user `PATH`.
+The script writes `nitrate.exe` and `tools` to `%LOCALAPPDATA%\nitrate`. Then it adds that directory to the user `PATH`.
 
 Open a new terminal after the install. Then run `nitrate`.
 
 If you want a different directory, set `NITRATE_INSTALL_DIR` before you run the script.
 
-### Release binaries
+### Release archives
 
 GitHub Releases include:
 
-- `nitrate-linux-x64`
-- `nitrate-linux-arm64`
-- `nitrate-macos-arm64`
-- `nitrate-macos-x64`
-- `nitrate-windows-x64.exe`
+- `nitrate-linux-x64.tar.gz`
+- `nitrate-linux-arm64.tar.gz`
+- `nitrate-macos-arm64.tar.gz`
+- `nitrate-macos-x64.tar.gz`
+- `nitrate-windows-x64.zip`
+
+Each archive contains `nitrate` and a `tools` directory with `yt-dlp`, `ffmpeg`, and `ffprobe`.
 
 ### Install from source
 
-You need Rust 1.88 or newer.
+You need Rust 1.88 or newer. You also need `curl` so the build can download `yt-dlp` and `ffmpeg`.
 
 ```sh
 cargo install --git https://github.com/imjulianeral/nitrate --locked
 ```
 
+`cargo install` writes only the `nitrate` binary. It does not write the `tools` directory. Use a GitHub Release if you want the bundled programs.
+
 To build from a clone:
 
 1. Clone the repository.
 2. Run `cargo build --release`.
-3. Copy `target/release/nitrate` to a directory on `PATH`.
+3. Copy `target/release/nitrate` and `target/release/tools` to one directory.
+4. Put that directory on `PATH`, or run the binary from that directory.
+
+The release build downloads `yt-dlp` and `ffmpeg` into `vendor/tools` and copies them to `target/release/tools`.
+
+Set `NITRATE_SKIP_BUNDLE=1` if you do not want the download. Then you must have `yt-dlp` and `ffmpeg` on `PATH`.
 
 ## Update
 
-NITRATE reads the latest GitHub Release and replaces the current binary.
+NITRATE reads the latest GitHub Release and replaces the current binary and the `tools` directory.
 
 ### Command line
 
@@ -89,13 +98,13 @@ When a newer release exists, the console shows an update hint.
 1. Press `U`.
 2. Quit the console.
 
-The update then writes the new binary over the current one.
+The update then writes the new files over the current ones.
 
 ### Installer
 
-You can run the install command again. The installer overwrites the binary in the install directory.
+You can run the install command again. The installer overwrites the files in the install directory.
 
-`nitrate update` replaces the binary that is in use. The installer writes to the default install directory.
+`nitrate update` replaces the files next to the binary that is in use. The installer writes to the default install directory.
 
 If you installed to a custom directory, set `NITRATE_INSTALL_DIR`. Then run the installer again.
 
@@ -112,6 +121,10 @@ nitrate version
 nitrate help
 ```
 
+You can set `YT_DLP` and `FFMPEG` to force a program path. If you do not set these, NITRATE uses the bundled programs in `tools` next to the binary.
+
 ## License
 
 MIT
+
+The bundled `ffmpeg` and `ffprobe` binaries are GPL. The bundled `yt-dlp` binaries include third-party licenses from the yt-dlp project.

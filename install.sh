@@ -27,11 +27,11 @@ case "$arch" in
     ;;
 esac
 
-ext=""
 if [ "$os" = windows ]; then
-  ext=".exe"
+  asset="${BIN}-${os}-${arch}.zip"
+else
+  asset="${BIN}-${os}-${arch}.tar.gz"
 fi
-asset="${BIN}-${os}-${arch}${ext}"
 url="https://github.com/${REPO}/releases/latest/download/${asset}"
 
 if [ -n "${NITRATE_INSTALL_DIR:-}" ]; then
@@ -46,18 +46,46 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "curl is required" >&2
   exit 1
 fi
+if ! command -v tar >/dev/null 2>&1; then
+  echo "tar is required" >&2
+  exit 1
+fi
 
 mkdir -p "$dest_dir"
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT INT HUP
+stage=$(mktemp -d)
+trap 'rm -rf "$tmp" "$stage"' EXIT INT HUP
 
 echo "GET  $url"
 curl -fsSL --retry 3 --connect-timeout 10 -A nitrate "$url" -o "$tmp"
-chmod +x "$tmp"
-mv "$tmp" "${dest_dir}/${BIN}${ext}"
-trap - EXIT INT HUP
+tar -xf "$tmp" -C "$stage"
 
-echo "WRITE  ${dest_dir}/${BIN}${ext}"
+if [ ! -f "$stage/${BIN}" ] && [ ! -f "$stage/${BIN}.exe" ]; then
+  echo "archive is missing ${BIN}" >&2
+  exit 1
+fi
+
+if [ -f "$stage/${BIN}.exe" ]; then
+  mv "$stage/${BIN}.exe" "${dest_dir}/${BIN}.exe"
+  bin_name="${BIN}.exe"
+else
+  chmod +x "$stage/${BIN}"
+  mv "$stage/${BIN}" "${dest_dir}/${BIN}"
+  bin_name="${BIN}"
+fi
+
+if [ -d "$stage/tools" ]; then
+  mkdir -p "${dest_dir}/tools"
+  # shellcheck disable=SC2035
+  mv "$stage/tools/"* "${dest_dir}/tools/"
+  chmod +x "${dest_dir}/tools/"* 2>/dev/null || true
+fi
+
+trap - EXIT INT HUP
+rm -rf "$tmp" "$stage"
+
+echo "WRITE  ${dest_dir}/${bin_name}"
+echo "WRITE  ${dest_dir}/tools"
 echo "NITRATE  installed"
 case ":$PATH:" in
   *":${dest_dir}:"*) ;;

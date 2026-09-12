@@ -15,8 +15,99 @@ pub fn github_repo() -> &'static str {
 pub fn asset_name() -> Option<String> {
     let os = host_os()?;
     let arch = host_arch()?;
-    let ext = if os == "windows" { ".exe" } else { "" };
-    Some(format!("nitrate-{os}-{arch}{ext}"))
+    if os == "windows" {
+        Some(format!("nitrate-{os}-{arch}.zip"))
+    } else {
+        Some(format!("nitrate-{os}-{arch}.tar.gz"))
+    }
+}
+
+fn apply_latest() -> Result<PathBuf, String> {
+    let asset = asset_name().ok_or("UNSUPPORTED PLATFORM")?;
+    let url = format!(
+        "https://github.com/{}/releases/latest/download/{asset}",
+        github_repo()
+    );
+    let tmp = temp_download_path(&asset)?;
+    http_download(&url, &tmp)?;
+    let exe = std::env::current_exe().map_err(|e| format!("EXE: {e}"))?;
+    let dest_dir = exe.parent().ok_or("EXE DIR")?.to_path_buf();
+    let unpack = {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nitrate-unpack-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).map_err(|e| format!("UNPACK DIR: {e}"))?;
+        p
+    };
+    unpack_archive(&tmp, &unpack)?;
+    let src_bin = find_unpacked_bin(&unpack)?;
+    replace_exe(&src_bin, &exe)?;
+    let src_tools = src_bin
+        .parent()
+        .map(|d| d.join("tools"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| unpack.join("tools"));
+    if src_tools.is_dir() {
+        copy_tree(&src_tools, &dest_dir.join("tools"))?;
+    }
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_dir_all(&unpack);
+    Ok(exe)
+}
+
+fn unpack_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .map_err(|e| format!("TAR: {e}"))?;
+    if !status.success() {
+        return Err("UNPACK FAILED".into());
+    }
+    Ok(())
+}
+
+fn find_unpacked_bin(dir: &Path) -> Result<PathBuf, String> {
+    let name = if cfg!(windows) {
+        "nitrate.exe"
+    } else {
+        "nitrate"
+    };
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    if let Ok(rd) = fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let cand = ent.path().join(name);
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+    Err("ARCHIVE MISSING NITRATE".into())
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
+    fs::create_dir_all(dest).map_err(|e| format!("TOOLS DIR: {e}"))?;
+    for ent in fs::read_dir(src).map_err(|e| format!("TOOLS: {e}"))? {
+        let ent = ent.map_err(|e| format!("TOOLS: {e}"))?;
+        let from = ent.path();
+        let to = dest.join(ent.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            fs::copy(&from, &to).map_err(|e| format!("COPY {}: {e}", from.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&to, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn host_os() -> Option<&'static str> {
@@ -93,19 +184,6 @@ fn fetch_latest_version() -> Result<String, String> {
     parse_tag(&body).ok_or_else(|| "NO RELEASE TAG".into())
 }
 
-fn apply_latest() -> Result<PathBuf, String> {
-    let asset = asset_name().ok_or("UNSUPPORTED PLATFORM")?;
-    let url = format!(
-        "https://github.com/{}/releases/latest/download/{asset}",
-        github_repo()
-    );
-    let tmp = temp_download_path(&asset)?;
-    http_download(&url, &tmp)?;
-    let exe = std::env::current_exe().map_err(|e| format!("EXE: {e}"))?;
-    replace_exe(&tmp, &exe)?;
-    let _ = fs::remove_file(&tmp);
-    Ok(exe)
-}
 
 fn temp_download_path(asset: &str) -> Result<PathBuf, String> {
     let mut p = std::env::temp_dir();
@@ -218,9 +296,9 @@ mod tests {
         let name = asset_name().expect("supported host");
         assert!(name.starts_with("nitrate-"));
         if cfg!(windows) {
-            assert!(name.ends_with(".exe"));
+            assert!(name.ends_with(".zip"));
         } else {
-            assert!(!name.ends_with(".exe"));
+            assert!(name.ends_with(".tar.gz"));
         }
     }
 

@@ -307,12 +307,24 @@ fn tool_filenames(name: &str) -> Vec<String> {
     }
 }
 
+fn bundled_tool_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.join("tools"));
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs
+}
+
 fn which(name: &str) -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
+    let mut dirs = bundled_tool_dirs();
     if let Ok(cwd) = std::env::current_dir() {
-        dirs.insert(0, cwd);
+        dirs.push(cwd);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
     }
     #[cfg(unix)]
     {
@@ -378,6 +390,7 @@ pub struct JobSpec {
     pub duration: Option<f64>,
     pub output_dir: PathBuf,
     pub playlist: bool,
+    pub ffmpeg: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,6 +486,10 @@ pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
         "download:NITRATE_PCT:%(progress.percent)s %(progress._speed_str)s %(progress._eta_str)s".into(),
     ];
     args.extend(js_runtime_args());
+    if let Some(ff) = spec.ffmpeg.as_ref() {
+        args.push("--ffmpeg-location".into());
+        args.push(ff.to_string_lossy().into_owned());
+    }
     if spec.playlist {
         args.push("--yes-playlist".into());
     } else {
@@ -543,6 +560,7 @@ pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
 
 pub fn spawn_probe(
     ytdlp: PathBuf,
+    ffmpeg: Option<PathBuf>,
     url: String,
     playlist: bool,
     kill: Arc<AtomicBool>,
@@ -560,6 +578,10 @@ pub fn spawn_probe(
                 "--skip-download".into(),
             ];
             args.extend(js_runtime_args());
+            if let Some(ff) = ffmpeg.as_ref() {
+                args.push("--ffmpeg-location".into());
+                args.push(ff.to_string_lossy().into_owned());
+            }
             if playlist {
                 args.push("--yes-playlist".into());
             } else {
@@ -570,7 +592,8 @@ pub fn spawn_probe(
 
             let mut stdout = String::new();
             let mut last_err = String::new();
-            let status = match run_streaming(&ytdlp, &args, &kill, |pipe, line| match pipe {
+            let tools_dir = ffmpeg.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+            let status = match run_streaming(&ytdlp, &args, &kill, tools_dir.as_deref(), |pipe, line| match pipe {
                 Pipe::Out => {
                     stdout.push_str(line);
                     stdout.push('\n');
@@ -649,7 +672,8 @@ pub fn spawn_download(
             let mut part = 0usize;
             let mut last_raw = 0.0f64;
 
-            let status = match run_streaming(&ytdlp, &args, &kill, |_, line| {
+            let tools_dir = spec.ffmpeg.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
+            let status = match run_streaming(&ytdlp, &args, &kill, tools_dir.as_deref(), |_, line| {
                 if let Some(rest) = line.split("format(s):").nth(1) {
                     let n = rest.split('+').filter(|s| !s.trim().is_empty()).count();
                     if n > 0 {
@@ -757,17 +781,32 @@ fn run_streaming(
     bin: &Path,
     args: &[String],
     kill: &AtomicBool,
+    tools_dir: Option<&Path>,
     mut on_line: impl FnMut(Pipe, &str),
 ) -> Result<ExitStatus, String> {
-    let mut child = command(bin)
-        .args(args)
+    let mut cmd = command(bin);
+    cmd.args(args)
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = tools_dir {
+        prepend_path(&mut cmd, dir);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("SPAWN {bin:?}: {e}"))?;
     pump(&mut child, kill, &mut on_line)
+}
+
+fn prepend_path(cmd: &mut Command, dir: &Path) {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
 }
 
 fn pump(
@@ -1137,6 +1176,42 @@ mod tests {
     }
 
     #[test]
+    fn bundled_dirs_include_tools_subdir() {
+        let dirs = bundled_tool_dirs();
+        assert!(
+            dirs.iter().any(|d| d.ends_with("tools")),
+            "{dirs:?}"
+        );
+    }
+
+    #[test]
+    fn args_pass_ffmpeg_location() {
+        let spec = JobSpec {
+            url: "https://youtu.be/x".into(),
+            mode: MediaMode::Video,
+            video_container: VideoContainer::Mp4,
+            audio_container: AudioContainer::Mp3,
+            video_quality: 0,
+            audio_quality: 0,
+            exact_format: None,
+            exact_has_audio: false,
+            exact_has_video: true,
+            trim_in: None,
+            trim_out: None,
+            duration: None,
+            output_dir: PathBuf::from("/tmp/nitrate"),
+            playlist: false,
+            ffmpeg: Some(PathBuf::from("/opt/nitrate/tools/ffmpeg")),
+        };
+        let args = build_ytdlp_args(&spec);
+        let loc = args
+            .windows(2)
+            .find(|w| w[0] == "--ffmpeg-location")
+            .map(|w| w[1].as_str());
+        assert_eq!(loc, Some("/opt/nitrate/tools/ffmpeg"));
+    }
+
+    #[test]
     fn selector_caps_height() {
         let max = video_format_selector(None, VideoContainer::Mp4);
         assert!(max.contains("+ba"), "{max}");
@@ -1163,6 +1238,7 @@ mod tests {
             duration: Some(32.0),
             output_dir: PathBuf::from("/tmp/nitrate"),
             playlist: false,
+            ffmpeg: None,
         };
         let args = build_ytdlp_args(&spec);
         assert!(args.contains(&"--no-playlist".into()));
@@ -1200,6 +1276,7 @@ mod tests {
             duration: None,
             output_dir: PathBuf::from("/tmp/nitrate"),
             playlist: false,
+            ffmpeg: None,
         };
         let sel = video_mux_format(&spec);
         assert_eq!(sel, "137+bestaudio/bv*+ba/b");
@@ -1223,6 +1300,7 @@ mod tests {
             duration: None,
             output_dir: PathBuf::from("/tmp/out"),
             playlist: true,
+            ffmpeg: None,
         };
         let args = build_ytdlp_args(&spec);
         assert!(args.contains(&"--yes-playlist".into()));

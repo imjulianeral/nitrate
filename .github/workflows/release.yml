@@ -16,20 +16,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            asset: nitrate-linux-x64
+            asset: nitrate-linux-x64.tar.gz
             musl: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: nitrate-linux-arm64
+            asset: nitrate-linux-arm64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: nitrate-macos-arm64
+            asset: nitrate-macos-arm64.tar.gz
           - os: macos-13
             target: x86_64-apple-darwin
-            asset: nitrate-macos-x64
+            asset: nitrate-macos-x64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: nitrate-windows-x64.exe
+            asset: nitrate-windows-x64.zip
             windows: true
     runs-on: ${{ matrix.os }}
     env:
@@ -50,13 +50,25 @@ jobs:
       - name: package unix
         if: ${{ !matrix.windows }}
         run: |
+          set -eu
           bin="target/${{ matrix.target }}/release/nitrate"
+          tools="target/${{ matrix.target }}/release/tools"
           strip "$bin" || true
-          cp "$bin" "${{ matrix.asset }}"
+          stage=$(mktemp -d)
+          cp "$bin" "$stage/nitrate"
+          mkdir -p "$stage/tools"
+          cp -a "$tools"/. "$stage/tools/"
+          chmod +x "$stage/nitrate" "$stage/tools/"* || true
+          tar -czf "${{ matrix.asset }}" -C "$stage" nitrate tools
       - name: package windows
         if: matrix.windows
         shell: pwsh
-        run: Copy-Item "target/${{ matrix.target }}/release/nitrate.exe" "${{ matrix.asset }}"
+        run: |
+          $stage = New-Item -ItemType Directory -Force -Path "stage"
+          Copy-Item "target/${{ matrix.target }}/release/nitrate.exe" "$stage/nitrate.exe"
+          New-Item -ItemType Directory -Force -Path "$stage/tools" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/tools/*" "$stage/tools/"
+          Compress-Archive -Path "$stage/nitrate.exe","$stage/tools" -DestinationPath "${{ matrix.asset }}" -Force
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}

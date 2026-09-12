@@ -1005,7 +1005,8 @@ impl App {
         self.last_error = None;
         self.progress.percent = 0.0;
         self.log(format!("LOCKING  {url}"));
-        engine::spawn_probe(bin, url, self.playlist, kill, self.tx.clone());
+        let ffmpeg = self.tools.ffmpeg.as_ref().map(|(p, _)| p.clone());
+        engine::spawn_probe(bin, ffmpeg, url, self.playlist, kill, self.tx.clone());
     }
 
     pub fn fire(&mut self) {
@@ -1061,6 +1062,7 @@ impl App {
             duration: self.trim_range().map(|(_, _, dur)| dur).or_else(|| self.duration()),
             output_dir: PathBuf::from(self.output.text()),
             playlist: self.playlist,
+            ffmpeg: self.tools.ffmpeg.as_ref().map(|(p, _)| p.clone()),
         }
     }
 }
