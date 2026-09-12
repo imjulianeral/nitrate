@@ -1,6 +1,6 @@
 [package]
 name = "nitrate"
-version = "1.0.0"
+version = "0.0.2"
 edition = "2021"
 description = "NITRATE — tactical video extraction console"
 license = "MIT"
