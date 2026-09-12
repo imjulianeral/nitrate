@@ -9,7 +9,7 @@ use std::thread;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn github_repo() -> &'static str {
-    option_env!("NITRATE_GITHUB_REPO").unwrap_or("scrtx/video-tools")
+    option_env!("NITRATE_GITHUB_REPO").unwrap_or("imjulianeral/nitrate")
 }
 
 pub fn asset_name() -> Option<String> {
@@ -226,6 +226,6 @@ mod tests {
 
     #[test]
     fn github_repo_is_set() {
-        assert!(github_repo().contains('/'));
+        assert_eq!(github_repo(), "imjulianeral/nitrate");
     }
 }

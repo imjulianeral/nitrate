@@ -1,8 +1,8 @@
 #!/bin/sh
-# curl -fsSL https://github.com/scrtx/video-tools/releases/latest/download/install.sh | sh
+# curl -fsSL https://github.com/imjulianeral/nitrate/releases/latest/download/install.sh | sh
 set -eu
 
-REPO="${NITRATE_REPO:-scrtx/video-tools}"
+REPO="${NITRATE_REPO:-imjulianeral/nitrate}"
 BIN="nitrate"
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')

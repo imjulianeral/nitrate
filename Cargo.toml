@@ -5,7 +5,7 @@ edition = "2021"
 description = "NITRATE — tactical video extraction console"
 license = "MIT"
 rust-version = "1.88"
-repository = "https://github.com/scrtx/video-tools"
+repository = "https://github.com/imjulianeral/nitrate"
 
 [dependencies]
 crossterm = "0.29"

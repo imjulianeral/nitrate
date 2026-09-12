@@ -1,6 +1,6 @@
-# irm https://github.com/scrtx/video-tools/releases/latest/download/install.ps1 | iex
+# irm https://github.com/imjulianeral/nitrate/releases/latest/download/install.ps1 | iex
 $ErrorActionPreference = "Stop"
-$repo = if ($env:NITRATE_REPO) { $env:NITRATE_REPO } else { "scrtx/video-tools" }
+$repo = if ($env:NITRATE_REPO) { $env:NITRATE_REPO } else { "imjulianeral/nitrate" }
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
 $asset = "nitrate-windows-$arch.exe"
 $url = "https://github.com/$repo/releases/latest/download/$asset"

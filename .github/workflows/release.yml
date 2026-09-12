@@ -35,7 +35,7 @@ jobs:
     env:
       NITRATE_GITHUB_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -57,7 +57,7 @@ jobs:
         if: matrix.windows
         shell: pwsh
         run: Copy-Item "target/${{ matrix.target }}/release/nitrate.exe" "${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
@@ -67,17 +67,17 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
       - name: stamp installer
         run: |
-          sed "s|scrtx/video-tools|${GITHUB_REPOSITORY}|g" install.sh > dist/install.sh
-          sed "s|scrtx/video-tools|${GITHUB_REPOSITORY}|g" install.ps1 > dist/install.ps1
+          sed "s|imjulianeral/nitrate|${GITHUB_REPOSITORY}|g" install.sh > dist/install.sh
+          sed "s|imjulianeral/nitrate|${GITHUB_REPOSITORY}|g" install.ps1 > dist/install.ps1
           chmod +x dist/install.sh
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
