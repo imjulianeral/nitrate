@@ -564,7 +564,8 @@ pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
         };
         args.push("--download-sections".into());
         args.push(format!("*{start}-{end}"));
-        args.push("--force-keyframes-at-cuts".into());
+        // Copy the range. --force-keyframes-at-cuts recodes from the network
+        // stream and ffmpeg then exits 69 (decode error rate exceeded).
     }
 
     let template = spec
@@ -1269,6 +1270,7 @@ mod tests {
         assert!(!args.contains(&"--cookies-from-browser".into()));
         assert!(args.contains(&"--download-sections".into()));
         assert!(args.iter().any(|a| a == "*12-44"));
+        assert!(!args.contains(&"--force-keyframes-at-cuts".into()));
         assert!(args.contains(&"--merge-output-format".into()));
         assert!(args.contains(&"mp4".into()));
         assert!(!args.contains(&"--remux-video".into()));

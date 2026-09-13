@@ -71,8 +71,6 @@ pub enum TrimHandle {
 pub struct TrimDrag {
     pub handle: TrimHandle,
     pub x: u16,
-    pub origin_col: u16,
-    pub origin_t: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +154,6 @@ pub struct App {
     pub particles: Vec<Particle>,
     pub hits: Hits,
     pub trim_drag: Option<TrimDrag>,
-    pub trim_view: f64,
     pub rng: Rng,
     pub update_available: Option<String>,
     pub apply_update: bool,
@@ -206,7 +203,6 @@ impl App {
             particles: Vec::new(),
             hits: Hits::default(),
             trim_drag: None,
-            trim_view: 0.0,
             rng: Rng::new(0x4E495452415445),
             update_available: None,
             apply_update: false,
@@ -729,44 +725,6 @@ impl App {
         }
     }
 
-    pub fn sync_trim_view(&mut self, width: u16) {
-        if self.trim_drag.is_some() {
-            return;
-        }
-        let Some((inn, out, dur)) = self.trim_range() else {
-            self.trim_view = 0.0;
-            return;
-        };
-        let span = f64::from(util::trim_span(width));
-        if dur <= span || out <= span {
-            self.trim_view = 0.0;
-            return;
-        }
-        if out - inn <= span {
-            let mut v = inn.round();
-            if out > v + span {
-                v = (out - span).round();
-            }
-            self.trim_view = v.clamp(0.0, (dur - span).max(0.0));
-            return;
-        }
-        let t = if self.focus == Focus::TrimOut { out } else { inn };
-        self.trim_view = (t - span / 2.0).round().clamp(0.0, (dur - span).max(0.0));
-    }
-
-    fn pan_trim_view(&mut self, t: f64, width: u16, dur: f64) {
-        let span = f64::from(util::trim_span(width));
-        if dur <= span {
-            self.trim_view = 0.0;
-            return;
-        }
-        if t < self.trim_view {
-            self.trim_view = t;
-        } else if t > self.trim_view + span {
-            self.trim_view = t - span;
-        }
-        self.trim_view = self.trim_view.clamp(0.0, (dur - span).max(0.0));
-    }
 
     pub fn handle_mouse(&mut self, m: MouseEvent) {
         if self.phase == Phase::Boot {
@@ -874,10 +832,9 @@ impl App {
         if bar.width == 0 {
             return;
         }
-        self.sync_trim_view(bar.width);
         let x = col.saturating_sub(bar.x).min(bar.width.saturating_sub(1));
-        let in_x = util::trim_x(inn, self.trim_view, bar.width);
-        let out_x = util::trim_x(out, self.trim_view, bar.width);
+        let in_x = util::trim_x(inn, dur, bar.width);
+        let out_x = util::trim_x(out, dur, bar.width);
         let on_in = in_x == Some(x);
         let on_out = out_x == Some(x);
         let handle = if on_in && !on_out {
@@ -891,7 +848,7 @@ impl App {
                 TrimHandle::In
             }
         } else {
-            let t = util::trim_t(x, self.trim_view, dur);
+            let t = util::trim_t(x, dur, bar.width);
             if (t - inn).abs() <= (t - out).abs() {
                 TrimHandle::In
             } else {
@@ -906,22 +863,9 @@ impl App {
             TrimHandle::In => on_in,
             TrimHandle::Out => on_out,
         };
-        let origin_t = if hold {
-            match handle {
-                TrimHandle::In => inn.round() as i64,
-                TrimHandle::Out => out.round() as i64,
-            }
-        } else {
-            util::trim_t(x, self.trim_view, dur).round() as i64
-        };
-        self.trim_drag = Some(TrimDrag {
-            handle,
-            x,
-            origin_col: col,
-            origin_t,
-        });
+        self.trim_drag = Some(TrimDrag { handle, x });
         if !hold {
-            self.apply_trim_drag();
+            self.apply_trim_drag_at(col);
         }
     }
 
@@ -929,11 +873,6 @@ impl App {
         if self.trim_drag.is_none() {
             return;
         }
-        self.apply_trim_drag_at(col);
-    }
-
-    fn apply_trim_drag(&mut self) {
-        let col = self.trim_drag.map(|d| d.origin_col).unwrap_or(0);
         self.apply_trim_drag_at(col);
     }
 
@@ -948,24 +887,34 @@ impl App {
         if bar.width == 0 {
             return;
         }
-        let raw = (drag.origin_t + i64::from(col) - i64::from(drag.origin_col)) as f64;
+        let x = col.saturating_sub(bar.x).min(bar.width.saturating_sub(1));
+        let raw = util::trim_t(x, dur, bar.width);
         const GAP: f64 = 1.0;
         let t = match drag.handle {
-            TrimHandle::In => raw.round().clamp(0.0, (out - GAP).max(0.0)),
-            TrimHandle::Out => raw.round().clamp((inn + GAP).min(dur), dur),
+            TrimHandle::In => raw.clamp(0.0, (out - GAP).max(0.0)),
+            TrimHandle::Out => raw.clamp((inn + GAP).min(dur), dur),
         };
-        self.pan_trim_view(t, bar.width, dur);
-        let x = util::trim_x(t, self.trim_view, bar.width).unwrap_or(0);
+        let mut draw_x = x;
+        match drag.handle {
+            TrimHandle::In => {
+                if let Some(ox) = util::trim_x(out, dur, bar.width) {
+                    draw_x = draw_x.min(ox.saturating_sub(1));
+                }
+            }
+            TrimHandle::Out => {
+                if let Some(ix) = util::trim_x(inn, dur, bar.width) {
+                    draw_x = draw_x.max(ix.saturating_add(1).min(bar.width.saturating_sub(1)));
+                }
+            }
+        }
         if let Some(d) = &mut self.trim_drag {
-            d.x = x;
+            d.x = draw_x;
         }
         match drag.handle {
             TrimHandle::In => self.trim_in.set(&format_timestamp(t)),
             TrimHandle::Out => self.trim_out.set(&format_timestamp(t)),
         }
     }
-
-
 
     fn click_timeline_out(&mut self, col: u16) {
         self.trim_drag = None;
@@ -976,9 +925,8 @@ impl App {
         if bar.width == 0 {
             return;
         }
-        self.sync_trim_view(bar.width);
         let x = col.saturating_sub(bar.x).min(bar.width.saturating_sub(1));
-        let t = util::trim_t(x, self.trim_view, dur).clamp((inn + 1.0).min(dur), dur);
+        let t = util::trim_t(x, dur, bar.width).clamp((inn + 1.0).min(dur), dur);
         self.trim_out.set(&format_timestamp(t));
         self.focus = Focus::TrimOut;
     }
@@ -1155,49 +1103,48 @@ mod tests {
     #[test]
     fn clicking_in_handle_does_not_jump() {
         let mut app = armed();
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 6));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, 6));
         assert_eq!(app.trim_in.text(), "0:10");
         assert_eq!(app.trim_out.text(), "0:20");
         let drag = app.trim_drag.expect("grab IN");
         assert_eq!(drag.handle, TrimHandle::In);
-        assert_eq!(drag.x, 10);
-        assert_eq!(drag.origin_t, 10);
+        assert_eq!(drag.x, 2);
     }
 
     #[test]
     fn clicking_out_handle_does_not_jump() {
         let mut app = armed();
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 6));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 14, 6));
         assert_eq!(app.trim_in.text(), "0:10");
         assert_eq!(app.trim_out.text(), "0:20");
         let drag = app.trim_drag.expect("grab OUT");
         assert_eq!(drag.handle, TrimHandle::Out);
-        assert_eq!(drag.x, 20);
+        assert_eq!(drag.x, 4);
     }
 
     #[test]
-    fn drag_follows_cursor_one_second_per_cell() {
+    fn drag_follows_cursor_across_full_duration() {
         let mut app = armed();
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 6));
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 14, 6));
-        assert_eq!(app.trim_in.text(), "0:04");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, 6));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 11, 6));
+        assert_eq!(app.trim_in.text(), "0:05");
         let drag = app.trim_drag.expect("dragging");
         assert_eq!(drag.handle, TrimHandle::In);
-        assert_eq!(drag.x, 4);
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 14, 6));
+        assert_eq!(drag.x, 1);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 11, 6));
         assert!(app.trim_drag.is_none());
-        assert_eq!(app.trim_in.text(), "0:04");
+        assert_eq!(app.trim_in.text(), "0:05");
     }
 
     #[test]
     fn track_click_moves_nearest_handle_to_cursor() {
         let mut app = armed();
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 16, 6));
-        assert_eq!(app.trim_in.text(), "0:06");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 11, 6));
+        assert_eq!(app.trim_in.text(), "0:05");
         assert_eq!(app.trim_out.text(), "0:20");
         let drag = app.trim_drag.expect("grab nearest");
         assert_eq!(drag.handle, TrimHandle::In);
-        assert_eq!(drag.x, 6);
+        assert_eq!(drag.x, 1);
     }
 
     #[test]
@@ -1218,28 +1165,30 @@ mod tests {
     #[test]
     fn in_cannot_cross_out() {
         let mut app = armed();
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 6));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, 6));
         app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30, 6));
         assert_eq!(app.trim_in.text(), "0:19");
         assert_eq!(app.trim_out.text(), "0:20");
+        let drag = app.trim_drag.expect("clamped");
+        assert_eq!(drag.x, 3);
     }
 
     #[test]
-    fn long_video_drag_is_one_second_per_cell() {
+    fn long_video_maps_start_and_end_to_bar_edges() {
         let mut app = armed();
         if let Some(info) = app.info.as_mut() {
             info.duration = Some(3600.0);
         }
         app.trim_in.set("1:40");
         app.trim_out.set("10:00");
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 6));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 11, 6));
         assert_eq!(app.trim_in.text(), "1:40");
         let drag = app.trim_drag.expect("grab IN");
         assert_eq!(drag.handle, TrimHandle::In);
-        assert_eq!(drag.origin_t, 100);
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 21, 6));
-        assert_eq!(app.trim_in.text(), "1:41");
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 25, 6));
-        assert_eq!(app.trim_in.text(), "1:45");
+        assert_eq!(drag.x, 1);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 12, 6));
+        assert_eq!(app.trim_in.text(), "6:00");
+        let drag = app.trim_drag.expect("dragging");
+        assert_eq!(drag.x, 2);
     }
 }

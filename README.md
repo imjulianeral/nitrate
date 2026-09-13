@@ -2,7 +2,7 @@
 
 NITRATE is a terminal console for video extraction. It uses yt-dlp to fetch streams. It uses ffmpeg to merge and trim.
 
-Repository: <https://github.com/imjulianeral/nitrate>
+![nitrate screenshot](./screenshot.png)
 
 ## Requirements
 

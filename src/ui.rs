@@ -382,34 +382,24 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Length(12),
     ])
     .split(inner);
-    app.hits.trim_in = cols[0];
-    app.hits.trim_out = cols[2];
-    app.hits.trim_bar = cols[1];
 
-    let inn_s = if app.trim_in.is_empty() {
-        "IN 0:00"
-    } else {
-        "IN"
-    };
-    let out_s = if app.trim_out.is_empty() {
-        "OUT END"
-    } else {
-        "OUT"
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(inn_s, theme::dim())),
-            Line::from(field_line(&app.trim_in, 10, app.focus == Focus::TrimIn)),
-        ]),
+    app.hits.trim_in = draw_time_box(
+        frame,
         cols[0],
+        "IN",
+        &app.trim_in,
+        app.focus == Focus::TrimIn,
+        "0:00",
     );
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(out_s.to_string(), theme::dim())).right_aligned(),
-            Line::from(field_line(&app.trim_out, 10, app.focus == Focus::TrimOut)).alignment(Alignment::Right),
-        ]),
+    app.hits.trim_out = draw_time_box(
+        frame,
         cols[2],
+        "OUT",
+        &app.trim_out,
+        app.focus == Focus::TrimOut,
+        "END",
     );
+    app.hits.trim_bar = cols[1];
 
     let bar = Rect {
         x: cols[1].x,
@@ -420,26 +410,19 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
     if bar.width > 0 {
         if let Some((inn, out, dur)) = app.trim_range() {
             let w = bar.width;
-            app.sync_trim_view(w);
-            let view = app.trim_view.round();
-            let view_end = view + f64::from(util::trim_span(w));
-            let mut x0 = util::trim_x(inn, view, w);
-            let mut x1 = util::trim_x(out, view, w);
+            let mut x0 = util::trim_x(inn, dur, w);
+            let mut x1 = util::trim_x(out, dur, w);
             if let Some(drag) = app.trim_drag {
                 match drag.handle {
                     TrimHandle::In => x0 = Some(drag.x.min(w.saturating_sub(1))),
                     TrimHandle::Out => x1 = Some(drag.x.min(w.saturating_sub(1))),
                 }
             }
-            let fill_lo = if out >= view && inn <= view_end {
-                Some(((inn.max(view) - view).round() as u16).min(w.saturating_sub(1)))
-            } else {
-                None
-            };
-            let fill_hi = if out >= view && inn <= view_end {
-                Some(((out.min(view_end) - view).round() as u16).min(w.saturating_sub(1)))
-            } else {
-                None
+            let (fill_lo, fill_hi) = match (x0, x1) {
+                (Some(a), Some(b)) => (Some(a.min(b)), Some(a.max(b))),
+                (Some(a), None) => (Some(a), Some(a)),
+                (None, Some(b)) => (Some(b), Some(b)),
+                _ => (None, None),
             };
             for i in 0..w {
                 let on_in = x0 == Some(i);
@@ -476,9 +459,9 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
                 };
                 let caption = slider_caption(
                     w as usize,
-                    &format_timestamp(view),
+                    &format_timestamp(0.0),
                     &format_timestamp(live),
-                    &format_timestamp(view_end.min(dur)),
+                    &format_timestamp(dur),
                 );
                 frame.render_widget(
                     Paragraph::new(caption).style(theme::ghost()),
@@ -497,6 +480,55 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
             );
         }
     }
+}
+
+fn draw_time_box(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    field: &Field,
+    focused: bool,
+    hint: &str,
+) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let box_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.min(3),
+    };
+    let borders = if box_area.height >= 3 {
+        Borders::ALL
+    } else {
+        Borders::LEFT | Borders::RIGHT
+    };
+    let block = Block::bordered()
+        .borders(borders)
+        .border_style(theme::border(focused))
+        .title(format!(" {title} "))
+        .title_style(theme::title(focused))
+        .style(theme::input(focused));
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+    if inner.width == 0 || inner.height == 0 {
+        return box_area;
+    }
+    let w = inner.width as usize;
+    if field.is_empty() && !focused {
+        frame.render_widget(
+            Paragraph::new(hint).style(Style::new().fg(theme::FG_GHOST).bg(theme::BG_ELEVATED)),
+            inner,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(field_line(field, w, focused)), inner);
+    }
+    if focused {
+        let (_, cur_x) = field.visible(w);
+        frame.set_cursor_position(Position::new(inner.x + cur_x as u16, inner.y));
+    }
+    box_area
 }
 
 fn slider_caption(width: usize, left: &str, mid: &str, right: &str) -> String {
@@ -670,10 +702,8 @@ fn field_line(field: &Field, width: usize, focused: bool) -> Line<'static> {
         let is_cur = focused && i == cur;
         let sty = if is_cur {
             Style::new().fg(theme::BG).bg(theme::RED)
-        } else if focused {
-            theme::input(true)
         } else {
-            theme::root()
+            theme::input(focused)
         };
         spans.push(Span::styled(ch.to_string(), sty));
     }
@@ -929,7 +959,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("← → on QUALITY        MAX..360P or BEST..64K"),
         Line::from("← → on FORMAT         MP4 MKV WEBM MOV / MP3 M4A OPUS FLAC WAV OGG AAC"),
         Line::from("[ ] { }               nudge trim 1s / 5s"),
-        Line::from("DRAG ● / ○            1 second per cell   RIGHT-CLICK sets OUT"),
+        Line::from("DRAG ● / ○            range on full video   RIGHT-CLICK sets OUT"),
         Line::from("CTRL-U / CTRL-W       clear field / kill word"),
         Line::from("U / nitrate update    apply latest GitHub release"),
         Line::from("ESC                   abort live job"),
@@ -1076,5 +1106,40 @@ mod tests {
         assert!(!text.contains("PASTE URL TO CUT"), "{text}");
         assert!(!text.contains("LOCK TARGET"), "{text}");
         assert!(app.trim_range().is_some());
+    }
+
+    #[test]
+    fn trim_handles_sit_at_start_and_end_with_time_boxes() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.skip_boot();
+        app.info = Some(crate::engine::VideoInfo {
+            id: "abc".into(),
+            title: "t".into(),
+            duration: Some(3600.0),
+            extractor: "Youtube".into(),
+            webpage_url: "https://youtu.be/abc".into(),
+            platform: crate::util::Platform::YouTube,
+        });
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text = dump(buf);
+        let bar = app.hits.trim_bar;
+        let y = bar.y.saturating_add(1);
+        assert_eq!(buf[(bar.x, y)].symbol(), "●", "{text}");
+        assert_eq!(
+            buf[(bar.x + bar.width.saturating_sub(1), y)].symbol(),
+            "○",
+            "{text}"
+        );
+        let inn = app.hits.trim_in;
+        let out = app.hits.trim_out;
+        assert_eq!(buf[(inn.x, inn.y)].symbol(), "┌", "{text}");
+        assert_eq!(buf[(out.x, out.y)].symbol(), "┌", "{text}");
+        assert!(text.contains(" IN "), "{text}");
+        assert!(text.contains(" OUT "), "{text}");
     }
 }

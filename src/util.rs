@@ -217,20 +217,23 @@ pub fn trim_span(width: u16) -> u16 {
     width.saturating_sub(1).max(1)
 }
 
-pub fn trim_x(t: f64, view: f64, width: u16) -> Option<u16> {
-    if width == 0 {
+pub fn trim_x(t: f64, dur: f64, width: u16) -> Option<u16> {
+    if width == 0 || !(dur > 0.0) {
         return None;
     }
-    let rel = t.round() - view.round();
-    if rel < 0.0 || rel > f64::from(trim_span(width)) {
-        None
-    } else {
-        Some(rel as u16)
-    }
+    let span = f64::from(trim_span(width));
+    let x = (t.clamp(0.0, dur) / dur * span).round();
+    Some(x.clamp(0.0, span) as u16)
 }
 
-pub fn trim_t(x: u16, view: f64, dur: f64) -> f64 {
-    (view.round() + f64::from(x)).round().clamp(0.0, dur.max(0.0))
+pub fn trim_t(x: u16, dur: f64, width: u16) -> f64 {
+    if width == 0 || !(dur > 0.0) {
+        return 0.0;
+    }
+    let span = f64::from(trim_span(width));
+    (f64::from(x.min(trim_span(width))) / span * dur)
+        .round()
+        .clamp(0.0, dur)
 }
 
 
@@ -396,17 +399,19 @@ mod tests {
     }
 
     #[test]
-    fn trim_maps_one_cell_to_one_second() {
+    fn trim_maps_full_duration_across_bar() {
         assert_eq!(trim_span(21), 20);
-        assert_eq!(trim_x(0.0, 0.0, 21), Some(0));
-        assert_eq!(trim_x(20.0, 0.0, 21), Some(20));
-        assert_eq!(trim_x(21.0, 0.0, 21), None);
-        assert_eq!(trim_x(50.0, 40.0, 21), Some(10));
-        assert_eq!(trim_t(0, 0.0, 100.0), 0.0);
-        assert_eq!(trim_t(10, 40.0, 100.0), 50.0);
+        assert_eq!(trim_x(0.0, 100.0, 21), Some(0));
+        assert_eq!(trim_x(100.0, 100.0, 21), Some(20));
+        assert_eq!(trim_x(50.0, 100.0, 21), Some(10));
+        assert_eq!(trim_t(0, 100.0, 21), 0.0);
+        assert_eq!(trim_t(10, 100.0, 21), 50.0);
+        assert_eq!(trim_t(20, 100.0, 21), 100.0);
+        assert_eq!(trim_x(0.0, 3600.0, 21), Some(0));
+        assert_eq!(trim_x(3600.0, 3600.0, 21), Some(20));
         for x in 0..21u16 {
-            let t = trim_t(x, 0.0, 100.0);
-            assert_eq!(trim_x(t, 0.0, 21), Some(x), "x={x} t={t}");
+            let t = trim_t(x, 100.0, 21);
+            assert_eq!(trim_x(t, 100.0, 21), Some(x), "x={x} t={t}");
         }
     }
 
