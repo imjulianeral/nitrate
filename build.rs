@@ -5,6 +5,7 @@ use std::process::Command;
 
 const YTDLP_TAG: &str = "2026.08.19";
 const FFMPEG_TAG: &str = "n8.1.2-1";
+const QJS_TAG: &str = "v0.16.2";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -58,6 +59,8 @@ fn tool_files(os: &str, arch: &str, env: &str) -> Option<Vec<(String, String)>> 
     let ff_base = format!(
         "https://github.com/shaka-project/static-ffmpeg-binaries/releases/download/{FFMPEG_TAG}"
     );
+    let qjs_base =
+        format!("https://github.com/quickjs-ng/quickjs/releases/download/{QJS_TAG}");
 
     let (ytdlp_src, ytdlp_dst, ffmpeg_src, ffprobe_src, ffmpeg_dst, ffprobe_dst) =
         match (os, arch) {
@@ -112,6 +115,15 @@ fn tool_files(os: &str, arch: &str, env: &str) -> Option<Vec<(String, String)>> 
             _ => return None,
         };
 
+    let (qjs_src, qjs_dst) = match (os, arch) {
+        ("linux", "x86_64") => ("qjs-linux-x86_64", "qjs"),
+        ("linux", "aarch64") => ("qjs-linux-aarch64", "qjs"),
+        ("macos", "aarch64") => ("qjs-darwin-arm64", "qjs"),
+        ("macos", "x86_64") => ("qjs-darwin-x86_64", "qjs"),
+        ("windows", "x86_64") => ("qjs-windows-x86_64.exe", "qjs.exe"),
+        _ => return None,
+    };
+
     Some(vec![
         (
             ytdlp_dst.into(),
@@ -124,6 +136,10 @@ fn tool_files(os: &str, arch: &str, env: &str) -> Option<Vec<(String, String)>> 
         (
             ffprobe_dst.into(),
             format!("{ff_base}/{ffprobe_src}"),
+        ),
+        (
+            qjs_dst.into(),
+            format!("{qjs_base}/{qjs_src}"),
         ),
     ])
 }

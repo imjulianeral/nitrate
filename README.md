@@ -6,11 +6,15 @@ Repository: <https://github.com/imjulianeral/nitrate>
 
 ## Requirements
 
-The installer and the GitHub Release archives include `yt-dlp`, `ffmpeg`, and `ffprobe`. You do not install these programs yourself.
+The installer and the GitHub Release archives include `yt-dlp`, `ffmpeg`, `ffprobe`, and `qjs`.
+You do not install these programs yourself.
+
+`yt-dlp` uses `qjs` for YouTube. You do not install Node.js or Deno.
 
 `curl` is required for the installer and for `nitrate update`.
 
 If you build from source, a release build downloads the same programs into `target/release/tools`.
+
 
 ## Install
 
@@ -54,7 +58,7 @@ GitHub Releases include:
 - `nitrate-macos-x64.tar.gz`
 - `nitrate-windows-x64.zip`
 
-Each archive contains `nitrate` and a `tools` directory with `yt-dlp`, `ffmpeg`, and `ffprobe`.
+Each archive contains `nitrate` and a `tools` directory with `yt-dlp`, `ffmpeg`, `ffprobe`, and `qjs`.
 
 ### Install from source
 
@@ -121,7 +125,7 @@ nitrate version
 nitrate help
 ```
 
-You can set `YT_DLP` and `FFMPEG` to force a program path. If you do not set these, NITRATE uses the bundled programs in `tools` next to the binary.
+You can set `YT_DLP` and `FFMPEG` to force a program path. If you do not set these, NITRATE uses the bundled programs in `tools` next to the binary. That directory includes `qjs` for YouTube.
 
 ## Cut a release
 
@@ -144,4 +148,4 @@ The script writes the new version to `Cargo.toml` and `Cargo.lock`. Then it crea
 
 MIT
 
-The bundled `ffmpeg` and `ffprobe` binaries are GPL. The bundled `yt-dlp` binaries include third-party licenses from the yt-dlp project.
+The bundled `ffmpeg` and `ffprobe` binaries are GPL. The bundled `yt-dlp` binaries include third-party licenses from the yt-dlp project. The bundled `qjs` binary is QuickJS-NG (MIT).

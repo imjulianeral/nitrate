@@ -362,17 +362,41 @@ fn which(name: &str) -> Option<PathBuf> {
 
 
 fn js_runtime_args() -> Vec<String> {
-    if which("deno").is_some() {
-        return vec!["--js-runtimes".into(), "deno".into()];
+    js_runtime_from(
+        which("qjs"),
+        which("deno"),
+        which("node").or_else(|| which("nodejs")),
+    )
+}
+
+fn js_runtime_from(
+    qjs: Option<PathBuf>,
+    deno: Option<PathBuf>,
+    node: Option<PathBuf>,
+) -> Vec<String> {
+    if let Some(path) = qjs {
+        // yt-dlp enables only Deno by default. Force bundled qjs instead.
+        return vec![
+            "--no-js-runtimes".into(),
+            "--js-runtimes".into(),
+            format!("quickjs:{}", path.display()),
+        ];
     }
-    if let Some(node) = which("node").or_else(|| which("nodejs")) {
+    if let Some(path) = deno {
         return vec![
             "--js-runtimes".into(),
-            format!("node:{}", node.display()),
+            format!("deno:{}", path.display()),
+        ];
+    }
+    if let Some(path) = node {
+        return vec![
+            "--js-runtimes".into(),
+            format!("node:{}", path.display()),
         ];
     }
     Vec::new()
 }
+
 
 #[derive(Clone, Debug)]
 pub struct JobSpec {
@@ -1368,4 +1392,56 @@ mod tests {
         assert_eq!(info.duration, Some(90.0));
         assert_eq!(info.platform, Platform::YouTube);
     }
+
+    #[test]
+    fn js_runtime_prefers_bundled_qjs() {
+        let args = js_runtime_from(
+            Some(PathBuf::from("/opt/nitrate/tools/qjs")),
+            Some(PathBuf::from("/usr/bin/deno")),
+            Some(PathBuf::from("/usr/bin/node")),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--no-js-runtimes".to_string(),
+                "--js-runtimes".to_string(),
+                "quickjs:/opt/nitrate/tools/qjs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn js_runtime_keeps_windows_drive_after_first_colon() {
+        let args = js_runtime_from(
+            Some(PathBuf::from(r"C:\Users\a\AppData\Local\nitrate\tools\qjs.exe")),
+            None,
+            None,
+        );
+        assert_eq!(args[0], "--no-js-runtimes");
+        assert_eq!(args[1], "--js-runtimes");
+        assert_eq!(
+            args[2],
+            r"quickjs:C:\Users\a\AppData\Local\nitrate\tools\qjs.exe"
+        );
+    }
+
+    #[test]
+    fn js_runtime_falls_back_to_deno_then_node() {
+        assert!(js_runtime_from(None, None, None).is_empty());
+        assert_eq!(
+            js_runtime_from(None, Some(PathBuf::from("/usr/bin/deno")), None),
+            vec![
+                "--js-runtimes".to_string(),
+                "deno:/usr/bin/deno".to_string(),
+            ]
+        );
+        assert_eq!(
+            js_runtime_from(None, None, Some(PathBuf::from("/usr/bin/node"))),
+            vec![
+                "--js-runtimes".to_string(),
+                "node:/usr/bin/node".to_string(),
+            ]
+        );
+    }
+
 }
