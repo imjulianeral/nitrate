@@ -196,6 +196,8 @@ impl App {
                 speed_bps: 0,
                 stage: Stage::Download,
                 filename: String::new(),
+                downloaded: 0,
+                total_bytes: 0,
             },
             speed_hist: Vec::new(),
             last_path: None,

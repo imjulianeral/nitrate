@@ -239,8 +239,7 @@ fn replace_exe(src: &Path, dest: &Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(src, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("CHMOD: {e}"))?;
-        let _ = fs::remove_file(dest);
-        fs::rename(src, dest).map_err(|e| format!("REPLACE: {e}"))?;
+        install_file(src, dest)
     }
     #[cfg(windows)]
     {
@@ -249,9 +248,53 @@ fn replace_exe(src: &Path, dest: &Path) -> Result<(), String> {
         if dest.exists() {
             fs::rename(dest, &bak).map_err(|e| format!("RENAME: {e}"))?;
         }
-        fs::rename(src, dest).map_err(|e| format!("REPLACE: {e}"))?;
+        install_file(src, dest).map_err(|e| {
+            if bak.is_file() && !dest.exists() {
+                let _ = fs::rename(&bak, dest);
+            }
+            e
+        })
     }
+}
+
+// Download temp (`/tmp`) and the install dir are often different filesystems.
+// rename(2) then returns EXDEV. Copy beside dest and rename that over the
+// install path so the replace stays on one device and does not write the
+// running binary in place (ETXTBSY).
+fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
+    match fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => stage_replace(src, dest),
+        Err(e) => Err(format!("REPLACE: {e}")),
+    }
+}
+
+fn stage_replace(src: &Path, dest: &Path) -> Result<(), String> {
+    let staged = staged_beside(dest);
+    let _ = fs::remove_file(&staged);
+    if let Err(e) = fs::copy(src, &staged) {
+        let _ = fs::remove_file(&staged);
+        return Err(format!("REPLACE: {e}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)) {
+            let _ = fs::remove_file(&staged);
+            return Err(format!("CHMOD: {e}"));
+        }
+    }
+    if let Err(e) = fs::rename(&staged, dest) {
+        let _ = fs::remove_file(&staged);
+        return Err(format!("REPLACE: {e}"));
+    }
+    let _ = fs::remove_file(src);
     Ok(())
+}
+
+fn staged_beside(dest: &Path) -> PathBuf {
+    let name = dest.file_name().and_then(|s| s.to_str()).unwrap_or("bin");
+    dest.with_file_name(format!(".{name}.nitrate-update-{}", std::process::id()))
 }
 
 fn http_get(url: &str) -> Result<String, String> {
@@ -368,5 +411,99 @@ mod tests {
         promote_runnable_ytdlp(&dir);
         assert!(command_ok(&bad));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct RmDir(PathBuf);
+    impl Drop for RmDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn bin_name() -> &'static str {
+        if cfg!(windows) {
+            "nitrate.exe"
+        } else {
+            "nitrate"
+        }
+    }
+
+    fn unique_tag() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nitrate-{label}-{}-{}",
+            std::process::id(),
+            unique_tag()
+        ))
+    }
+
+    fn install_scratch(label: &str) -> PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "nitrate-{label}-{}-{}",
+                std::process::id(),
+                unique_tag()
+            ))
+    }
+
+    #[test]
+    fn replace_exe_same_directory() {
+        let dir = scratch_dir("replace-same");
+        let _keep = RmDir(dir.clone());
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("incoming");
+        let dest = dir.join(bin_name());
+        fs::write(&dest, b"old").unwrap();
+        fs::write(&src, b"new-bin").unwrap();
+        replace_exe(&src, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new-bin");
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn stage_replace_overwrites_dest() {
+        let dir = scratch_dir("stage");
+        let _keep = RmDir(dir.clone());
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("incoming");
+        let dest = dir.join(bin_name());
+        fs::write(&dest, b"old").unwrap();
+        fs::write(&src, b"new-bin").unwrap();
+        stage_replace(&src, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new-bin");
+        assert!(!src.exists());
+        assert!(!staged_beside(&dest).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&dest).unwrap().permissions().mode() & 0o111,
+                0o111
+            );
+        }
+    }
+
+    #[test]
+    fn replace_exe_across_temp_and_install_dir() {
+        let src_dir = scratch_dir("xdev-src");
+        let dest_dir = install_scratch("xdev-dest");
+        let _src_keep = RmDir(src_dir.clone());
+        let _dest_keep = RmDir(dest_dir.clone());
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let src = src_dir.join("incoming");
+        let dest = dest_dir.join(bin_name());
+        fs::write(&dest, b"old").unwrap();
+        fs::write(&src, b"new-bin").unwrap();
+        replace_exe(&src, &dest).expect("replace across filesystems");
+        assert_eq!(fs::read(&dest).unwrap(), b"new-bin");
+        assert!(!src.exists());
     }
 }

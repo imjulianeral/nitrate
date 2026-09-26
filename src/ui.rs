@@ -789,11 +789,7 @@ fn draw_progress(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     let stamp = match app.phase {
-        Phase::Extracting if app.progress.percent < 1.0 => app.progress.stage.label().to_string(),
-        Phase::Extracting if app.progress.percent < 10.0 => {
-            format!("{:.1}%", app.progress.percent)
-        }
-        Phase::Extracting => format!("{:.0}%", app.progress.percent.clamp(0.0, 100.0)),
+        Phase::Extracting => format_live_percent(app.progress.percent),
         Phase::Done => "COMPLETE".into(),
         Phase::Failed => "ERROR".into(),
         _ => String::new(),
@@ -804,8 +800,8 @@ fn draw_progress(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let meta = match app.phase {
         Phase::Extracting => format!(
-            "{:.0}%  {}  ETA {}  {}",
-            app.progress.percent.clamp(0.0, 100.0),
+            "{}  {}  ETA {}  {}",
+            format_live_percent(app.progress.percent),
             if app.progress.speed.is_empty() {
                 "—"
             } else {
@@ -839,6 +835,15 @@ fn draw_progress(frame: &mut Frame, area: Rect, app: &mut App) {
             app.tick,
             live,
         );
+    }
+}
+
+fn format_live_percent(percent: f64) -> String {
+    let p = percent.clamp(0.0, 99.9);
+    if p < 10.0 || p >= 99.0 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.0}%")
     }
 }
 
@@ -1074,6 +1079,13 @@ mod tests {
             .unwrap();
         let text = dump(terminal.backend().buffer());
         assert!(text.contains("45%"), "{text}");
+
+        app.progress.percent = 0.4;
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+        let text = dump(terminal.backend().buffer());
+        assert!(text.contains("0.4%"), "{text}");
 
         app.phase = Phase::Done;
         app.progress.percent = 100.0;

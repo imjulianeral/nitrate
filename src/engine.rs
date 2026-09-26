@@ -500,6 +500,8 @@ pub struct Progress {
     pub speed_bps: u64,
     pub stage: Stage,
     pub filename: String,
+    pub downloaded: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +552,24 @@ fn video_mux_format(spec: &JobSpec) -> String {
     video_format_selector(height, spec.video_container)
 }
 
+fn progress_template() -> String {
+    concat!(
+        "download:NITRATE_PCT:",
+        "%(progress._percent)s|",
+        "%(progress.downloaded_bytes)s|",
+        "%(progress.total_bytes)s|",
+        "%(progress.total_bytes_estimate)s|",
+        "%(progress.fragment_index)s|",
+        "%(progress.fragment_count)s|",
+        "%(progress.speed)s|",
+        "%(progress.eta)s|",
+        "%(progress._speed_str)s|",
+        "%(progress._eta_str)s|",
+        "%(progress.filename)s",
+    )
+    .into()
+}
+
 pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
     let mut args = vec![
         "--color".into(),
@@ -557,7 +577,9 @@ pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
         "--progress".into(),
         "--newline".into(),
         "--progress-template".into(),
-        "download:NITRATE_PCT:%(progress.percent)s %(progress._speed_str)s %(progress._eta_str)s".into(),
+        // progress.percent is not a yt-dlp field; it renders NA and replaces
+        // the default [download] line, so the meter never moves.
+        progress_template(),
     ];
     args.extend(js_runtime_args());
     if let Some(ff) = spec.ffmpeg.as_ref() {
@@ -742,37 +764,36 @@ pub fn spawn_download(
                 speed_bps: 0,
                 stage: Stage::Download,
                 filename: String::new(),
+                downloaded: 0,
+                total_bytes: 0,
             };
-            let mut parts = if spec.mode == MediaMode::Video { 2 } else { 1 };
-            let mut part = 0usize;
-            let mut last_raw = 0.0f64;
+            let mut meter = DownloadMeter::default();
 
             let tools_dir = spec.ffmpeg.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
             let status = match run_streaming(&ytdlp, &args, &kill, tools_dir.as_deref(), |_, line| {
-                if let Some(rest) = line.split("format(s):").nth(1) {
-                    let n = rest.split('+').filter(|s| !s.trim().is_empty()).count();
-                    if n > 0 {
-                        parts = n;
-                    }
-                }
                 match interpret_line(line) {
                     LineKind::Progress(p) => {
-                        if p.percent + 12.0 < last_raw {
-                            part = (part + 1).min(parts.saturating_sub(1));
+                        let (overall, sizes) = meter.observe(&p);
+                        progress.percent = overall;
+                        progress.downloaded = p.downloaded;
+                        progress.total_bytes = p.total_bytes;
+                        if !p.filename.is_empty() {
+                            progress.filename = p.filename;
                         }
-                        last_raw = p.percent;
-                        let overall = (part as f64 * 100.0 + p.percent) / parts.max(1) as f64;
-                        progress.percent = overall.clamp(0.0, 99.9);
                         if !p.speed.is_empty() {
                             progress.speed = p.speed;
                         }
                         if !p.eta.is_empty() {
                             progress.eta = p.eta;
                         }
-                        if !p.total.is_empty() {
+                        if !sizes.is_empty() {
+                            progress.total = sizes;
+                        } else if !p.total.is_empty() {
                             progress.total = p.total;
                         }
-                        progress.speed_bps = p.speed_bps;
+                        if p.speed_bps > 0 {
+                            progress.speed_bps = p.speed_bps;
+                        }
                         progress.stage = Stage::Download;
                         let _ = tx.send(EngineEvent::Progress(progress.clone()));
                     }
@@ -805,15 +826,6 @@ pub fn spawn_download(
                         let _ = tx.send(EngineEvent::Log(msg));
                     }
                     LineKind::Log(msg) => {
-                        if let Some(rest) = msg.split("format(s):").nth(1) {
-                            let n = rest
-                                .split('+')
-                                .filter(|s| !s.trim().is_empty())
-                                .count();
-                            if n > 0 {
-                                parts = n;
-                            }
-                        }
                         let _ = tx.send(EngineEvent::Log(msg));
                     }
                 }
@@ -1033,6 +1045,9 @@ pub fn interpret_line(line: &str) -> LineKind {
 }
 
 fn parse_template_progress(rest: &str) -> Option<Progress> {
+    if rest.contains('|') {
+        return parse_pipe_progress(rest);
+    }
     let mut toks = rest.split_whitespace();
     let percent: f64 = toks.next()?.trim_end_matches('%').parse().ok()?;
     if !(0.0..=100.0).contains(&percent) {
@@ -1057,7 +1072,237 @@ fn parse_template_progress(rest: &str) -> Option<Progress> {
         speed_bps,
         stage: Stage::Download,
         filename: String::new(),
+        downloaded: 0,
+        total_bytes: 0,
     })
+}
+
+fn parse_pipe_progress(rest: &str) -> Option<Progress> {
+    let mut parts = rest.splitn(11, '|');
+    let reported = opt_f64(parts.next()?);
+    let downloaded = opt_u64(parts.next()?).unwrap_or(0);
+    let total = opt_u64(parts.next()?);
+    let estimate = opt_u64(parts.next()?);
+    let frag_i = opt_u64(parts.next()?);
+    let frag_n = opt_u64(parts.next()?);
+    let speed_num = opt_f64(parts.next()?);
+    let eta_num = opt_f64(parts.next()?);
+    let speed = clean_metric(parts.next().unwrap_or(""));
+    let eta_label = clean_metric(parts.next().unwrap_or(""));
+    let filename = parts.next().unwrap_or("").trim();
+    let filename = if missing_token(filename) {
+        String::new()
+    } else {
+        filename.to_string()
+    };
+    let total_bytes = total
+        .filter(|n| *n > 0)
+        .or(estimate.filter(|n| *n > 0))
+        .unwrap_or(0);
+    let percent = completion_percent(reported, downloaded, total_bytes, frag_i, frag_n);
+    let speed_bps = speed_num
+        .filter(|n| *n > 0.0)
+        .map(|n| n as u64)
+        .or_else(|| parse_yt_size(&speed))
+        .unwrap_or(0);
+    let eta = eta_num
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(format_eta_secs)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(eta_label);
+    let total_label = if total_bytes > 0 {
+        format!("{}/{}", format_bytes(downloaded), format_bytes(total_bytes))
+    } else {
+        String::new()
+    };
+    Some(Progress {
+        percent,
+        speed,
+        eta,
+        total: total_label,
+        speed_bps,
+        stage: Stage::Download,
+        filename,
+        downloaded,
+        total_bytes,
+    })
+}
+
+fn completion_percent(
+    reported: Option<f64>,
+    downloaded: u64,
+    total_bytes: u64,
+    frag_i: Option<u64>,
+    frag_n: Option<u64>,
+) -> f64 {
+    if total_bytes > 0 {
+        return (downloaded as f64 / total_bytes as f64 * 100.0).clamp(0.0, 100.0);
+    }
+    if let Some(p) = reported.filter(|p| (0.0..=100.0).contains(p)) {
+        return p;
+    }
+    if let (Some(i), Some(n)) = (frag_i, frag_n) {
+        if n > 0 {
+            return (i as f64 / n as f64 * 100.0).clamp(0.0, 100.0);
+        }
+    }
+    0.0
+}
+
+fn missing_token(s: &str) -> bool {
+    let s = s.trim();
+    s.is_empty()
+        || s.eq_ignore_ascii_case("NA")
+        || s.eq_ignore_ascii_case("N/A")
+        || s.eq_ignore_ascii_case("None")
+        || s.eq_ignore_ascii_case("nan")
+        || s.eq_ignore_ascii_case("Unknown")
+}
+
+fn clean_metric(s: &str) -> String {
+    let s = s.trim();
+    if missing_token(s) || s.to_ascii_lowercase().contains("unknown") {
+        String::new()
+    } else {
+        s.to_string()
+    }
+}
+
+fn opt_f64(s: &str) -> Option<f64> {
+    let s = s.trim().trim_end_matches('%');
+    if missing_token(s) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+fn opt_u64(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if missing_token(s) {
+        return None;
+    }
+    let n: f64 = s.parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Some(n as u64)
+}
+
+fn format_eta_secs(secs: f64) -> String {
+    let s = secs.round() as u64;
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m:02}:{sec:02}")
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n}B")
+    } else if v >= 100.0 {
+        format!("{v:.0}{}", UNITS[i])
+    } else {
+        format!("{v:.1}{}", UNITS[i])
+    }
+}
+
+#[derive(Default)]
+struct DownloadMeter {
+    files: Vec<FileSlot>,
+}
+
+struct FileSlot {
+    name: String,
+    downloaded: u64,
+    total: u64,
+    percent: f64,
+}
+
+impl DownloadMeter {
+    fn observe(&mut self, p: &Progress) -> (f64, String) {
+        let name = p.filename.trim();
+        if name.is_empty() {
+            self.observe_anon(p);
+        } else if let Some(slot) = self.files.iter_mut().find(|s| s.name == name) {
+            slot.downloaded = p.downloaded;
+            slot.total = p.total_bytes;
+            slot.percent = p.percent;
+        } else {
+            self.files.push(FileSlot {
+                name: name.to_string(),
+                downloaded: p.downloaded,
+                total: p.total_bytes,
+                percent: p.percent,
+            });
+        }
+        (self.overall(), self.size_label())
+    }
+
+    fn observe_anon(&mut self, p: &Progress) {
+        if let Some(last) = self.files.last() {
+            if last.name.is_empty() && p.percent + 12.0 < last.percent {
+                if let Some(prev) = self.files.last_mut() {
+                    if prev.total == 0 {
+                        prev.percent = 100.0;
+                    }
+                }
+                self.files.push(FileSlot {
+                    name: String::new(),
+                    downloaded: p.downloaded,
+                    total: p.total_bytes,
+                    percent: p.percent,
+                });
+                return;
+            }
+        }
+        if let Some(slot) = self.files.iter_mut().rev().find(|s| s.name.is_empty()) {
+            slot.downloaded = p.downloaded;
+            slot.total = p.total_bytes;
+            slot.percent = p.percent;
+        } else {
+            self.files.push(FileSlot {
+                name: String::new(),
+                downloaded: p.downloaded,
+                total: p.total_bytes,
+                percent: p.percent,
+            });
+        }
+    }
+
+    fn overall(&self) -> f64 {
+        if self.files.is_empty() {
+            return 0.0;
+        }
+        if self.files.iter().all(|f| f.total > 0) {
+            let dl: u128 = self.files.iter().map(|f| f.downloaded as u128).sum();
+            let tot: u128 = self.files.iter().map(|f| f.total as u128).sum();
+            if tot > 0 {
+                return (dl as f64 / tot as f64 * 100.0).clamp(0.0, 99.9);
+            }
+        }
+        let sum: f64 = self.files.iter().map(|f| f.percent).sum();
+        (sum / self.files.len() as f64).clamp(0.0, 99.9)
+    }
+
+    fn size_label(&self) -> String {
+        let dl: u128 = self.files.iter().map(|f| f.downloaded as u128).sum();
+        let tot: u128 = self.files.iter().map(|f| f.total as u128).sum();
+        if tot == 0 {
+            return String::new();
+        }
+        format!("{}/{}", format_bytes(dl as u64), format_bytes(tot as u64))
+    }
 }
 
 fn parse_ffmpeg_clock(s: &str) -> Option<f64> {
@@ -1156,6 +1401,12 @@ fn parse_percent_progress(rest: &str) -> Option<Progress> {
         }
     }
     let speed_bps = parse_yt_size(&speed).unwrap_or(0);
+    let total_bytes = parse_yt_size(&total).unwrap_or(0);
+    let downloaded = if total_bytes > 0 {
+        (percent / 100.0 * total_bytes as f64) as u64
+    } else {
+        0
+    };
     Some(Progress {
         percent: percent.clamp(0.0, 100.0),
         speed,
@@ -1164,6 +1415,8 @@ fn parse_percent_progress(rest: &str) -> Option<Progress> {
         speed_bps,
         stage: Stage::Download,
         filename: String::new(),
+        downloaded,
+        total_bytes,
     })
 }
 
@@ -1434,6 +1687,79 @@ mod tests {
             LineKind::MediaTime(sec) => assert!((sec - 12.0).abs() < 0.01),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn progress_template_uses_byte_fields() {
+        let tmpl = progress_template();
+        assert!(tmpl.contains("%(progress._percent)s"), "{tmpl}");
+        assert!(tmpl.contains("%(progress.downloaded_bytes)s"), "{tmpl}");
+        assert!(tmpl.contains("%(progress.total_bytes_estimate)s"), "{tmpl}");
+        assert!(tmpl.contains("%(progress.fragment_index)s"), "{tmpl}");
+        assert!(!tmpl.contains("%(progress.percent)s"), "{tmpl}");
+    }
+
+    #[test]
+    fn big_download_percent_comes_from_bytes_and_fragments() {
+        match interpret_line(
+            "NITRATE_PCT:NA|40000000|NA|10000000000|2|800|5000000.0|1992|4.77MiB/s|33:12|big.mp4",
+        ) {
+            LineKind::Progress(p) => {
+                assert!((p.percent - 0.4).abs() < 0.001, "{}", p.percent);
+                assert_eq!(p.downloaded, 40_000_000);
+                assert_eq!(p.total_bytes, 10_000_000_000);
+                assert_eq!(p.eta, "33:12");
+                assert_eq!(p.speed, "4.77MiB/s");
+                assert!(p.speed_bps > 4_000_000);
+            }
+            other => panic!("{other:?}"),
+        }
+        match interpret_line(
+            "NITRATE_PCT:NA|500000000|NA|NA|40|1200|8000000|NA|8.00MiB/s|Unknown|clip.mp4",
+        ) {
+            LineKind::Progress(p) => {
+                assert!(
+                    (p.percent - (40.0 / 1200.0 * 100.0)).abs() < 0.001,
+                    "{}",
+                    p.percent
+                );
+                assert!(p.eta.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn big_video_percent_tracks_bytes_across_streams() {
+        let video = match interpret_line(
+            "NITRATE_PCT:50|1000000000|2000000000|NA|NA|NA|8000000|120|8.00MiB/s|02:00|video.mp4",
+        ) {
+            LineKind::Progress(p) => p,
+            other => panic!("{other:?}"),
+        };
+        let mut meter = DownloadMeter::default();
+        let (pct, _) = meter.observe(&video);
+        assert!((pct - 50.0).abs() < 0.01, "{pct}");
+
+        let revised = match interpret_line(
+            "NITRATE_PCT:10|400000000|4000000000|NA|NA|NA|8000000|400|8.00MiB/s|06:40|video.mp4",
+        ) {
+            LineKind::Progress(p) => p,
+            other => panic!("{other:?}"),
+        };
+        let (pct, _) = meter.observe(&revised);
+        assert!((pct - 10.0).abs() < 0.01, "{pct}");
+
+        let audio = match interpret_line(
+            "NITRATE_PCT:0|0|20000000|NA|NA|NA|2000000|10|1.91MiB/s|00:10|audio.m4a",
+        ) {
+            LineKind::Progress(p) => p,
+            other => panic!("{other:?}"),
+        };
+        let (pct, label) = meter.observe(&audio);
+        let expect = 400_000_000.0 / 4_020_000_000.0 * 100.0;
+        assert!((pct - expect).abs() < 0.05, "{pct} vs {expect}");
+        assert!(label.contains('/'), "{label}");
     }
 
     #[test]
