@@ -59,6 +59,7 @@ GitHub Releases include:
 - `nitrate-windows-x64.zip`
 
 Each archive contains `nitrate` and a `tools` directory with `yt-dlp`, `ffmpeg`, `ffprobe`, and `qjs`.
+On Linux, the archive includes a glibc build and a musl build of `yt-dlp`. The installer keeps the build that runs on this machine as `yt-dlp`. NITRATE also skips a build that does not start.
 
 ### Install from source
 

@@ -48,7 +48,9 @@ fn apply_latest() -> Result<PathBuf, String> {
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| unpack.join("tools"));
     if src_tools.is_dir() {
-        copy_tree(&src_tools, &dest_dir.join("tools"))?;
+        let dest_tools = dest_dir.join("tools");
+        copy_tree(&src_tools, &dest_tools)?;
+        promote_runnable_ytdlp(&dest_tools);
     }
     let _ = fs::remove_file(&tmp);
     let _ = fs::remove_dir_all(&unpack);
@@ -108,6 +110,46 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn promote_runnable_ytdlp(tools: &Path) {
+    let primary = tools.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+    if command_ok(&primary) {
+        return;
+    }
+    for name in [
+        "yt-dlp-glibc",
+        "yt-dlp-musl",
+        "yt-dlp_linux",
+        "yt-dlp_linux_aarch64",
+        "yt-dlp_musllinux",
+        "yt-dlp_musllinux_aarch64",
+    ] {
+        let cand = tools.join(name);
+        if !command_ok(&cand) {
+            continue;
+        }
+        if fs::copy(&cand, &primary).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&primary, fs::Permissions::from_mode(0o755));
+        }
+        return;
+    }
+}
+
+fn command_ok(path: &Path) -> bool {
+    path.is_file()
+        && Command::new(path)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
 }
 
 pub fn host_os() -> Option<&'static str> {
@@ -305,5 +347,26 @@ mod tests {
     #[test]
     fn github_repo_is_set() {
         assert_eq!(github_repo(), "imjulianeral/nitrate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promote_replaces_unrunnable_ytdlp() {
+        let dir = std::env::temp_dir().join(format!("nitrate-promote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("yt-dlp");
+        let good = dir.join("yt-dlp-glibc");
+        fs::write(&bad, b"#!/no/such/nitrate-interp\n").unwrap();
+        fs::write(&good, b"#!/bin/sh\necho 2026.08.19\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&bad, &good] {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+        promote_runnable_ytdlp(&dir);
+        assert!(command_ok(&bad));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -124,24 +124,49 @@ fn tool_files(os: &str, arch: &str, env: &str) -> Option<Vec<(String, String)>> 
         _ => return None,
     };
 
-    Some(vec![
+    let mut files = vec![
         (
-            ytdlp_dst.into(),
+            ytdlp_dst.to_string(),
             format!("{ytdlp_base}/{ytdlp_src}"),
         ),
         (
-            ffmpeg_dst.into(),
+            ffmpeg_dst.to_string(),
             format!("{ff_base}/{ffmpeg_src}"),
         ),
         (
-            ffprobe_dst.into(),
+            ffprobe_dst.to_string(),
             format!("{ff_base}/{ffprobe_src}"),
         ),
-        (
-            qjs_dst.into(),
-            format!("{qjs_base}/{qjs_src}"),
-        ),
-    ])
+        (qjs_dst.to_string(), format!("{qjs_base}/{qjs_src}")),
+    ];
+    // One Linux archive is used on glibc and musl. The musl yt-dlp build
+    // needs /lib/ld-musl-*.so.1 and does not start on glibc.
+    if let Some(extra) = extra_linux_ytdlp(os, arch, ytdlp_src, &ytdlp_base) {
+        files.push(extra);
+    }
+    Some(files)
+}
+
+fn extra_linux_ytdlp(
+    os: &str,
+    arch: &str,
+    primary_src: &str,
+    base: &str,
+) -> Option<(String, String)> {
+    if os != "linux" {
+        return None;
+    }
+    let (glibc, musl) = match arch {
+        "x86_64" => ("yt-dlp_linux", "yt-dlp_musllinux"),
+        "aarch64" => ("yt-dlp_linux_aarch64", "yt-dlp_musllinux_aarch64"),
+        _ => return None,
+    };
+    let (dst, src) = if primary_src == musl {
+        ("yt-dlp-glibc", glibc)
+    } else {
+        ("yt-dlp-musl", musl)
+    };
+    Some((dst.to_string(), format!("{base}/{src}")))
 }
 
 fn download(url: &str, dest: &Path) {

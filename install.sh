@@ -51,6 +51,70 @@ if ! command -v tar >/dev/null 2>&1; then
   exit 1
 fi
 
+ytdlp_runs() {
+  [ -f "$1" ] && "$1" --version >/dev/null 2>&1
+}
+
+ytdlp_asset() {
+  musl=0
+  if [ -e /lib/ld-musl-x86_64.so.1 ] || [ -e /lib/ld-musl-aarch64.so.1 ]; then
+    musl=1
+  elif command -v ldd >/dev/null 2>&1 && ldd /bin/sh 2>&1 | grep -q musl; then
+    musl=1
+  fi
+  case "$arch" in
+    x64)
+      if [ "$musl" -eq 1 ]; then
+        printf '%s\n' yt-dlp_musllinux
+      else
+        printf '%s\n' yt-dlp_linux
+      fi
+      ;;
+    arm64)
+      if [ "$musl" -eq 1 ]; then
+        printf '%s\n' yt-dlp_musllinux_aarch64
+      else
+        printf '%s\n' yt-dlp_linux_aarch64
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_ytdlp() {
+  tools="${dest_dir}/tools"
+  mkdir -p "$tools"
+  primary="${tools}/yt-dlp"
+  if ytdlp_runs "$primary"; then
+    return 0
+  fi
+  for cand in \
+    "${tools}/yt-dlp-glibc" \
+    "${tools}/yt-dlp-musl" \
+    "${tools}/yt-dlp_linux" \
+    "${tools}/yt-dlp_linux_aarch64" \
+    "${tools}/yt-dlp_musllinux" \
+    "${tools}/yt-dlp_musllinux_aarch64"
+  do
+    if ytdlp_runs "$cand"; then
+      cp "$cand" "$primary"
+      chmod +x "$primary"
+      return 0
+    fi
+  done
+  if [ "$os" != linux ]; then
+    return 1
+  fi
+  asset=$(ytdlp_asset) || return 1
+  url="https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset}"
+  echo "GET  $url"
+  curl -fsSL --retry 3 --connect-timeout 20 -A nitrate "$url" -o "$primary"
+  chmod +x "$primary"
+  ytdlp_runs "$primary"
+}
+
 mkdir -p "$dest_dir"
 tmp=$(mktemp)
 stage=$(mktemp -d)
@@ -80,6 +144,11 @@ if [ -d "$stage/tools" ]; then
   mv "$stage/tools/"* "${dest_dir}/tools/"
   chmod +x "${dest_dir}/tools/"* 2>/dev/null || true
 fi
+if ! ensure_ytdlp; then
+  echo "yt-dlp does not run" >&2
+  exit 1
+fi
+
 
 trap - EXIT INT HUP
 rm -rf "$tmp" "$stage"

@@ -231,11 +231,20 @@ impl Tools {
 }
 
 fn find_tool(name: &str, env_key: &str, ver_args: &[&str]) -> Option<(PathBuf, String)> {
-    let path = std::env::var(env_key)
-        .ok()
-        .and_then(|p| existing_exe(PathBuf::from(p)))
-        .or_else(|| which(name))?;
-    let out = command(&path).args(ver_args).output().ok()?;
+    for path in tool_candidates(name, env_key) {
+        if let Some(found) = probe_tool(&path, ver_args) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn probe_tool(path: &Path, ver_args: &[&str]) -> Option<(PathBuf, String)> {
+    // Exists is not enough: yt-dlp_musllinux fails execve on glibc (missing ld-musl).
+    let out = command(path).args(ver_args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let text = if text.trim().is_empty() {
         String::from_utf8_lossy(&out.stderr).into_owned()
@@ -250,7 +259,33 @@ fn find_tool(name: &str, env_key: &str, ver_args: &[&str]) -> Option<(PathBuf, S
         .chars()
         .take(48)
         .collect();
-    Some((path, ver))
+    Some((path.to_path_buf(), ver))
+}
+
+fn tool_candidates(name: &str, env_key: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(path) = std::env::var(env_key)
+        .ok()
+        .and_then(|p| existing_exe(PathBuf::from(p)))
+    {
+        push_unique(&mut out, path);
+    }
+    let names = tool_filenames(name);
+    for dir in search_dirs() {
+        for n in &names {
+            let p = dir.join(n);
+            if p.is_file() {
+                push_unique(&mut out, p);
+            }
+        }
+    }
+    out
+}
+
+fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
+    if !out.iter().any(|p| p == &path) {
+        out.push(path);
+    }
 }
 
 fn command(bin: &Path) -> Command {
@@ -303,7 +338,18 @@ fn tool_filenames(name: &str) -> Vec<String> {
     }
     #[cfg(not(windows))]
     {
-        vec![name.to_string()]
+        let mut names = vec![name.to_string()];
+        if name == "yt-dlp" {
+            names.extend([
+                "yt-dlp-glibc".into(),
+                "yt-dlp-musl".into(),
+                "yt-dlp_linux".into(),
+                "yt-dlp_linux_aarch64".into(),
+                "yt-dlp_musllinux".into(),
+                "yt-dlp_musllinux_aarch64".into(),
+            ]);
+        }
+        names
     }
 }
 
@@ -318,7 +364,7 @@ fn bundled_tool_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn which(name: &str) -> Option<PathBuf> {
+fn search_dirs() -> Vec<PathBuf> {
     let mut dirs = bundled_tool_dirs();
     if let Ok(cwd) = std::env::current_dir() {
         dirs.push(cwd);
@@ -348,8 +394,12 @@ fn which(name: &str) -> Option<PathBuf> {
         dirs.push(PathBuf::from(r"C:\Program Files\yt-dlp"));
         dirs.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
     }
+    dirs
+}
+
+fn which(name: &str) -> Option<PathBuf> {
     let names = tool_filenames(name);
-    for dir in dirs {
+    for dir in search_dirs() {
         for n in &names {
             let p = dir.join(n);
             if p.is_file() {
@@ -1444,6 +1494,43 @@ mod tests {
                 "node:/usr/bin/node".to_string(),
             ]
         );
+    }
+    #[test]
+    fn ytdlp_filenames_include_libc_builds() {
+        let names = tool_filenames("yt-dlp");
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("yt-dlp") || n.eq_ignore_ascii_case("yt-dlp.exe")));
+        #[cfg(unix)]
+        {
+            assert!(names.iter().any(|n| n == "yt-dlp-glibc"));
+            assert!(names.iter().any(|n| n == "yt-dlp-musl"));
+            assert!(names.iter().position(|n| n == "yt-dlp") < names.iter().position(|n| n == "yt-dlp-glibc"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_skips_binary_with_missing_interpreter() {
+        let dir = std::env::temp_dir().join(format!("nitrate-ytdlp-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("yt-dlp");
+        let good = dir.join("yt-dlp-glibc");
+        std::fs::write(&bad, b"#!/no/such/nitrate-interp\n").unwrap();
+        std::fs::write(&good, b"#!/bin/sh\necho 2026.08.19\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&bad, &good] {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        assert!(probe_tool(&bad, &["--version"]).is_none());
+        let picked = [&bad, &good]
+            .into_iter()
+            .find_map(|path| probe_tool(path, &["--version"]))
+            .unwrap();
+        assert!(picked.0.ends_with("yt-dlp-glibc"), "{}", picked.0.display());
+        assert!(picked.1.contains("2026.08.19"), "{}", picked.1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }
