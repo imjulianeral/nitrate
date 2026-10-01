@@ -1,375 +1,467 @@
 use crate::app::{App, Focus, Phase, TrimHandle};
-use crate::effects::{self, MeterSkin};
-use crate::engine::{MediaMode, AUDIO_QUALITIES, VIDEO_QUALITIES};
+use crate::effects::{self, Meter};
+use crate::engine::{MediaMode, Stage, AUDIO_QUALITIES, VIDEO_QUALITIES};
 use crate::theme;
 use crate::util::{self, format_timestamp, Field};
+use crate::vhs::{self, LabelText};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::time::Duration;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(theme::root()), area);
+    if app.phase == Phase::Boot {
+        draw_boot(frame, area, app);
+        return;
+    }
     if area.width < 80 || area.height < 22 {
-        draw_tiny(frame, area, app);
-        finish(frame, app);
+        draw_tiny(frame, area);
         return;
     }
 
-    let cols = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Min(8),
-        Constraint::Length(5),
-        Constraint::Length(4),
+    let roomy = area.height >= 32;
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(10),
+        Constraint::Length(if roomy { 5 } else { 3 }),
+        Constraint::Length(if roomy { 5 } else { 4 }),
         Constraint::Length(1),
     ])
     .split(area);
 
-    draw_header(frame, cols[0], app);
-    draw_body(frame, cols[1], app);
-    draw_telemetry(frame, cols[2], app);
-    draw_progress(frame, cols[3], app);
-    draw_keys(frame, cols[4], app);
+    draw_header(frame, rows[0], app);
+    draw_body(frame, rows[1], app);
+    draw_log(frame, rows[2], app);
+    draw_tape(frame, rows[3], app);
+    draw_keys(frame, rows[4], app);
 
-    if app.phase == Phase::Boot {
-        draw_boot(frame, area, app);
-    }
     if app.help {
         draw_help(frame, area);
     }
-    finish(frame, app);
 }
 
-fn finish(frame: &mut Frame, app: &mut App) {
-    effects::render_particles(frame.buffer_mut(), &app.particles);
-}
-
-fn draw_tiny(frame: &mut Frame, area: Rect, app: &App) {
-    let msg = format!(
-        "NITRATE  VIEWPORT TOO SMALL  {}x{}  NEED 80x22",
-        area.width, area.height
-    );
+fn draw_tiny(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled("NITRATE", theme::accent_bold())),
+        Line::from(Span::styled(
+            format!("screen {}×{} — needs 80×22", area.width, area.height),
+            theme::dim(),
+        )),
+    ];
+    let y = area.y + area.height.saturating_sub(2) / 2;
     frame.render_widget(
-        Paragraph::new(msg)
-            .style(theme::accent_bold())
-            .alignment(Alignment::Center),
-        area,
+        Paragraph::new(lines).alignment(Alignment::Center),
+        Rect { y, height: area.height.min(2), ..area },
     );
-    let _ = app;
 }
 
 fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::bordered()
-        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(theme::border(focused))
-        .title(format!(" {title} "))
-        .title_style(theme::title(focused))
+        .title(Span::styled(format!(" {title} "), theme::title(focused)))
         .style(theme::root())
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let live = app.phase == Phase::Extracting;
-    let block = Block::bordered()
-        .border_style(if live {
-            theme::accent()
-        } else {
-            theme::border(false)
-        })
-        .title(" NITRATE ")
-        .title_style(theme::accent_bold())
-        .title(Line::from(vec![
-            Span::styled(" UNIT/VT-01 ", theme::dim()),
-            Span::styled(format!("REV {} ", crate::update::VERSION), theme::ghost()),
-        ]).right_aligned())
-        .style(theme::root());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
-    let clock = util::format_mission(app.started.elapsed());
-    let plat = app.platform().label();
-    let phase = app.phase.label();
-    let phase_style = match app.phase {
-        Phase::Done => theme::lock(),
-        Phase::Failed | Phase::Extracting => theme::accent_bold(),
-        Phase::Probing | Phase::Ready => theme::accent(),
-        _ => theme::bold(),
-    };
-
-    let line0 = Line::from(vec![
-        Span::styled("VIDEO EXTRACTION CONSOLE", theme::bold()),
-        Span::raw("   "),
-        Span::styled("///", theme::accent()),
-        Span::raw("   "),
-        Span::styled(clock, theme::dim()),
-        Span::raw("   "),
-        Span::styled(format!("FRM {:>6}", app.tick), theme::ghost()),
-    ]);
-    frame.render_widget(Paragraph::new(line0), rows[0]);
-
-    if live && rows[1].width > 0 {
-        effects::render_hazard(frame.buffer_mut(), rows[1], app.tick);
-        let stamp = format!(" {}  {}  {} ", plat, phase, app.progress.stage.label());
-        frame.buffer_mut().set_stringn(
-            rows[1].x,
-            rows[1].y,
-            &stamp,
-            stamp.len().min(rows[1].width as usize),
-            theme::accent_bold(),
-        );
-    } else {
-        let ytdlp = if app.tools.ytdlp.is_some() { "YT-DLP OK" } else { "YT-DLP --" };
-        let ffmpeg = if app.tools.ffmpeg.is_some() { "FFMPEG OK" } else { "FFMPEG --" };
-        let mut line1 = vec![
-            Span::styled(format!("{plat:<10}"), theme::accent()),
-            Span::styled(phase, phase_style),
-            Span::raw("   "),
-            Span::styled(ytdlp, theme::dim()),
-            Span::raw("  "),
-            Span::styled(ffmpeg, theme::dim()),
-            Span::raw("  "),
-            Span::styled("CLASS:UNRESTRICTED", theme::ghost()),
-        ];
-        if let Some(ver) = &app.update_available {
-            line1.push(Span::raw("  "));
-            line1.push(Span::styled(format!("UPDATE {ver}"), theme::accent_bold()));
-        }
-        let line1 = Line::from(line1);
-        frame.render_widget(Paragraph::new(line1), rows[1]);
-    }
+fn blink(app: &App, period: u64) -> bool {
+    (app.tick / period).is_multiple_of(2)
 }
 
+// ── header ──────────────────────────────────────────────────────────────
+
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let row = Rect { height: 1, ..area };
+    let mut left = vec![
+        Span::raw(" "),
+        Span::styled("NITRATE", theme::bold()),
+        Span::raw("  "),
+    ];
+    for c in theme::STRIPES {
+        left.push(Span::styled("━", Style::new().fg(c).bg(theme::BG)));
+    }
+    left.push(Span::raw("  "));
+    left.push(Span::styled("video cassette recorder", theme::ghost()));
+    frame.render_widget(Paragraph::new(Line::from(left)), row);
+
+    let lamp = |on: bool| {
+        Span::styled(
+            "●",
+            Style::new().fg(if on { theme::OK } else { theme::REC }).bg(theme::BG),
+        )
+    };
+    let mut right = Vec::new();
+    if let Some(ver) = &app.update_available {
+        right.push(Span::styled(format!("update {ver} ready  "), theme::accent()));
+    }
+    right.extend([
+        Span::styled("yt-dlp ", theme::ghost()),
+        lamp(app.tools.ytdlp.is_some()),
+        Span::styled("   ffmpeg ", theme::ghost()),
+        lamp(app.tools.ffmpeg.is_some()),
+        Span::styled(format!("   rev {} ", crate::update::VERSION), theme::ghost()),
+    ]);
+    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), row);
+}
+
+// ── body ────────────────────────────────────────────────────────────────
+
 fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
-    let cols = Layout::horizontal([
-        Constraint::Length(30),
-        Constraint::Min(36),
-        Constraint::Length(28),
-    ])
-    .split(area);
-    draw_left(frame, cols[0], app);
-    draw_center(frame, cols[1], app);
-    draw_right(frame, cols[2], app);
+    if area.width >= 104 {
+        let cols = Layout::horizontal([
+            Constraint::Length(30),
+            Constraint::Min(40),
+            Constraint::Length(30),
+        ])
+        .split(area);
+        draw_left(frame, cols[0], app);
+        draw_center(frame, cols[1], app);
+        draw_setup(frame, cols[2], app);
+    } else {
+        let cols = Layout::horizontal([Constraint::Min(40), Constraint::Length(30)]).split(area);
+        app.hits.history = Rect::default();
+        draw_center(frame, cols[0], app);
+        draw_setup(frame, cols[1], app);
+    }
 }
 
 fn draw_left(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(8),
-        Constraint::Length(6),
-        Constraint::Min(4),
+        Constraint::Length(4),
+        Constraint::Min(3),
     ])
     .split(area);
 
-    let ident = panel("IDENT", false);
-    let inner = ident.inner(rows[0]);
-    frame.render_widget(ident, rows[0]);
+    let block = panel("LABEL", false);
+    let inner = block.inner(rows[0]);
+    frame.render_widget(block, rows[0]);
+    let val_w = inner.width.saturating_sub(8) as usize;
     let url = app.url.text();
-    let plat = app.platform().label();
-    let id = app.info.as_ref().map(|i| i.id.as_str()).unwrap_or("—");
-    let dur = app
-        .duration()
-        .map(format_timestamp)
-        .unwrap_or_else(|| "--:--".into());
-    let val_w = inner.width.saturating_sub(5) as usize;
-    let title = if app.phase == Phase::Probing {
-        "LOCKING TARGET"
-    } else {
-        app.info
-            .as_ref()
-            .map(|i| i.title.as_str())
-            .unwrap_or("NO LOCK")
+    let plat = app.platform();
+    let info = app.info.as_ref();
+    let title = match (app.phase, info) {
+        (Phase::Probing, _) => "reading tape…",
+        (_, Some(i)) => i.title.as_str(),
+        _ => "—",
     };
-    let link = app
-        .info
-        .as_ref()
+    let link = info
         .map(|i| i.webpage_url.as_str())
         .filter(|s| !s.is_empty())
         .unwrap_or(url.as_str());
-    let ext = app
-        .info
-        .as_ref()
-        .map(|i| i.extractor.as_str())
-        .unwrap_or("—");
-    let ident_lines = vec![
-        Line::from(vec![
-            Span::styled("SRC  ", theme::dim()),
-            Span::styled(plat, theme::accent()),
-        ]),
-        Line::from(vec![
-            Span::styled("ID   ", theme::dim()),
-            Span::styled(id.to_string(), theme::root()),
-        ]),
-        Line::from(vec![
-            Span::styled("LEN  ", theme::dim()),
-            Span::styled(dur, theme::root()),
-        ]),
-        Line::from(vec![
-            Span::styled("TTL  ", theme::dim()),
-            Span::styled(util::marquee(title, val_w, app.tick), theme::bold()),
-        ]),
-        Line::from(vec![
-            Span::styled("EXT  ", theme::dim()),
-            Span::styled(util::marquee(&ext.to_ascii_uppercase(), val_w, app.tick), theme::accent()),
-        ]),
-        Line::from(vec![
-            Span::styled("URL  ", theme::dim()),
-            Span::styled(util::marquee(link, val_w, app.tick), theme::ghost()),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(ident_lines), inner);
-
-    let tools = panel("TOOLS", false);
-    let inner = tools.inner(rows[1]);
-    frame.render_widget(tools, rows[1]);
-    let y = match &app.tools.ytdlp {
-        Some((_, v)) => util::truncate(v, inner.width as usize),
-        None => "MISSING".into(),
+    let dur = app
+        .duration()
+        .map(format_timestamp)
+        .unwrap_or_else(|| "—".into());
+    let row = |key: &'static str, value: Span<'static>| {
+        Line::from(vec![Span::styled(format!(" {key:<7}"), theme::ghost()), value])
     };
-    let f = match &app.tools.ffmpeg {
-        Some((_, v)) => util::truncate(v, inner.width as usize),
-        None => "MISSING".into(),
+    let lines = vec![
+        row(
+            "source",
+            if url.trim().is_empty() && info.is_none() {
+                Span::styled("—", theme::root())
+            } else {
+                Span::styled(
+                    plat.label(),
+                    Style::new().fg(theme::platform(plat)).bg(theme::BG),
+                )
+            },
+        ),
+        row(
+            "id",
+            Span::styled(info.map(|i| i.id.clone()).unwrap_or("—".into()), theme::root()),
+        ),
+        row("length", Span::styled(dur, theme::root())),
+        row(
+            "title",
+            Span::styled(util::marquee(title, val_w, app.tick), theme::bold()),
+        ),
+        row(
+            "site",
+            Span::styled(
+                info.map(|i| i.extractor.to_ascii_lowercase())
+                    .unwrap_or("—".into()),
+                theme::dim(),
+            ),
+        ),
+        row(
+            "link",
+            Span::styled(util::marquee(link, val_w, app.tick), theme::ghost()),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let block = panel("TOOLS", false);
+    let inner = block.inner(rows[1]);
+    frame.render_widget(block, rows[1]);
+    let version = |tool: &Option<(std::path::PathBuf, String)>| match tool {
+        Some((_, v)) => Span::styled(
+            util::truncate(v, inner.width.saturating_sub(9) as usize),
+            theme::dim(),
+        ),
+        None => Span::styled("missing", theme::rec()),
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled("YT-DLP", theme::dim())),
-            Line::from(Span::styled(y, theme::root())),
-            Line::from(Span::styled("FFMPEG", theme::dim())),
-            Line::from(Span::styled(f, theme::root())),
+            Line::from(vec![
+                Span::styled(" yt-dlp  ", theme::ghost()),
+                version(&app.tools.ytdlp),
+            ]),
+            Line::from(vec![
+                Span::styled(" ffmpeg  ", theme::ghost()),
+                version(&app.tools.ffmpeg),
+            ]),
         ]),
         inner,
     );
 
-    let hist = panel("ARCHIVE", app.focus == Focus::History);
-    app.hits.history = rows[2];
-    let inner = hist.inner(rows[2]);
-    frame.render_widget(hist, rows[2]);
-    if app.history.is_empty() {
-        frame.render_widget(
-            Paragraph::new("NO WRITES").style(theme::ghost()),
-            inner,
-        );
-    } else {
-        let mut lines = Vec::new();
-        let h = inner.height as usize;
-        let start = app.history_cursor.saturating_sub(h.saturating_sub(1));
-        for (i, item) in app.history.iter().enumerate().skip(start).take(h) {
-            let mark = if item.ok { "+" } else { "x" };
-            let sty = if i == app.history_cursor && app.focus == Focus::History {
-                theme::accent_bold()
-            } else if !item.ok {
-                theme::accent()
-            } else {
-                theme::root()
-            };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{mark} {} {}",
-                    item.platform.label(),
-                    util::truncate(&item.title, inner.width.saturating_sub(8) as usize)
-                ),
-                sty,
-            )));
-        }
-        frame.render_widget(Paragraph::new(lines), inner);
+    draw_library(frame, rows[2], app);
+}
+
+/// Finished recordings, shelved as cassette spines.
+fn draw_library(frame: &mut Frame, area: Rect, app: &mut App) {
+    let focused = app.focus == Focus::History;
+    let block = panel("LIBRARY", focused);
+    app.hits.history = area;
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
     }
+    let count = match app.history.len() {
+        0 => "shelf is empty".to_string(),
+        1 => "1 tape".to_string(),
+        n => format!("{n} tapes"),
+    };
+    let mut lines = vec![Line::from(Span::styled(format!(" {count}"), theme::ghost()))];
+    let h = inner.height.saturating_sub(1) as usize;
+    let start = app.history_cursor.saturating_sub(h.saturating_sub(1));
+    let text_w = inner.width.saturating_sub(5) as usize;
+    for (i, item) in app.history.iter().enumerate().skip(start).take(h) {
+        let selected = focused && i == app.history_cursor;
+        let bg = if selected { theme::BG_SELECT } else { theme::BG };
+        let spine = if item.ok { theme::platform(item.platform) } else { theme::REC };
+        let fg = match (selected, item.ok) {
+            (true, _) => theme::AMBER,
+            (_, false) => theme::FG_GHOST,
+            _ => theme::FG,
+        };
+        let title = util::truncate(&item.title, text_w);
+        let pad = text_w.saturating_sub(unicode_width::UnicodeWidthStr::width(title.as_str()));
+        lines.push(Line::from(vec![
+            Span::styled(" ▐", Style::new().fg(spine).bg(theme::BG)),
+            Span::styled(" ", Style::new().bg(bg)),
+            Span::styled(title, Style::new().fg(fg).bg(bg)),
+            Span::styled(" ".repeat(pad + 1), Style::new().bg(bg)),
+            Span::styled(
+                if item.ok { " " } else { "✕" },
+                Style::new().fg(theme::REC).bg(bg),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_center(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(4),
         Constraint::Min(4),
-        Constraint::Length(3),
+        Constraint::Length(5),
     ])
     .split(area);
 
     app.hits.url = rows[0];
-    draw_input(frame, rows[0], "URL", &app.url, app.focus == Focus::Url, "paste target");
+    let url_focus = app.focus == Focus::Url;
+    let block = panel("URL", url_focus);
+    let inner = block.inner(rows[0]);
+    frame.render_widget(block, rows[0]);
+    draw_field(frame, inner, &app.url, url_focus, "paste a video link");
 
-    let pair = Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(rows[1]);
-    app.hits.mode = pair[0];
-    draw_choice(
-        frame,
-        pair[0],
-        "TYPE",
-        app.focus == Focus::Mode,
-        &[
-            (MediaMode::Video.label(), app.mode == MediaMode::Video),
-            (MediaMode::Audio.label(), app.mode == MediaMode::Audio),
-        ],
-    );
-    app.hits.container = pair[1];
-    match app.mode {
-        MediaMode::Video => {
-            let items: Vec<(&str, bool)> = crate::engine::VideoContainer::ALL
-                .iter()
-                .map(|c| (c.label(), *c == app.video_container))
-                .collect();
-            draw_choice(frame, pair[1], "FORMAT", app.focus == Focus::Container, &items);
-        }
-        MediaMode::Audio => {
-            let items: Vec<(&str, bool)> = crate::engine::AudioContainer::ALL
-                .iter()
-                .map(|c| (c.label(), *c == app.audio_container))
-                .collect();
-            draw_choice(frame, pair[1], "FORMAT", app.focus == Focus::Container, &items);
-        }
-    }
+    draw_deck(frame, rows[1], app);
 
-    app.hits.quality = rows[2];
-    match app.mode {
-        MediaMode::Video => {
-            let items: Vec<(&str, bool)> = VIDEO_QUALITIES
-                .iter()
-                .enumerate()
-                .map(|(i, q)| (q.label, i == app.video_quality))
-                .collect();
-            draw_choice(frame, rows[2], "QUALITY", app.focus == Focus::Quality, &items);
-        }
-        MediaMode::Audio => {
-            let items: Vec<(&str, bool)> = AUDIO_QUALITIES
-                .iter()
-                .enumerate()
-                .map(|(i, q)| (q.label, i == app.audio_quality))
-                .collect();
-            draw_choice(frame, rows[2], "QUALITY", app.focus == Focus::Quality, &items);
-        }
-    }
-
-    app.hits.timeline = rows[3];
-    draw_timeline(frame, rows[3], app);
-
-    app.hits.download = rows[4];
-    draw_download(frame, rows[4], app);
+    app.hits.timeline = rows[2];
+    draw_timeline(frame, rows[2], app);
 }
 
-fn draw_download(frame: &mut Frame, area: Rect, app: &App) {
-    let focused = app.focus == Focus::Download;
-    let fill = Style::new()
-        .fg(Color::Black)
-        .bg(theme::RED)
-        .add_modifier(Modifier::BOLD);
+// ── the deck ────────────────────────────────────────────────────────────
+
+/// What the post-processing step is doing, in plain words.
+fn stage_detail(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Merge => "joining video and audio",
+        Stage::Convert => "converting",
+        Stage::Trim => "cutting the clip",
+        Stage::Finalize => "finalizing the file",
+        Stage::Probe | Stage::Download => "",
+    }
+}
+
+fn clock_secs(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+fn stage_word(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Probe => "TRACKING",
+        Stage::Download => "RECORDING",
+        Stage::Merge => "SPLICING",
+        Stage::Convert => "DUBBING",
+        Stage::Trim => "EDITING",
+        Stage::Finalize => "FINISHING",
+    }
+}
+
+fn draw_deck(frame: &mut Frame, area: Rect, app: &App) {
+    let live = app.phase == Phase::Extracting;
     let block = Block::bordered()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(if focused { Color::Black } else { theme::RED }).bg(theme::RED))
-        .style(fill);
+        .border_type(BorderType::Rounded)
+        .border_style(if live {
+            Style::new().fg(theme::REC_DEEP).bg(theme::BG)
+        } else {
+            theme::border(false)
+        })
+        .title(Span::styled(" DECK ", theme::title(false)))
+        .style(Style::new().fg(theme::FG).bg(theme::BG_DECK));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let label = match app.phase {
-        Phase::Extracting => "WORKING",
-        _ => "DOWNLOAD",
+    if inner.height < 2 {
+        return;
+    }
+    let osd = Rect { height: 1, ..inner };
+    let bay = Rect {
+        y: inner.y + 1,
+        height: inner.height - 1,
+        ..inner
+    };
+
+    if app.deck.seated <= 0.0 && app.url.is_empty() {
+        vhs::render_slot(frame.buffer_mut(), bay, app.tick);
+    } else {
+        let info = app.info.as_ref();
+        let url = app.url.text();
+        let title = match (app.phase, info) {
+            (_, Some(i)) => i.title.clone(),
+            (Phase::Probing, None) => "reading tape…".into(),
+            _ => host(&url).unwrap_or_else(|| "untitled tape".into()),
+        };
+        let mut detail = vec![app.platform().label().to_string()];
+        if let Some(d) = app.duration() {
+            detail.push(format_timestamp(d));
+        }
+        detail.push(format!("{} {}", quality_label(app), container_label(app)));
+        let detail = detail.join(" · ");
+        let brand = format!("NITRATE {}", if app.mode == MediaMode::Audio { "HiFi" } else { "HQ" });
+        vhs::render_cassette(
+            frame.buffer_mut(),
+            bay,
+            &app.deck,
+            &LabelText {
+                title: &title,
+                detail: &detail,
+                brand: &brand,
+            },
+            app.tick,
+        );
+    }
+    if app.phase == Phase::Probing {
+        effects::render_tracking(frame.buffer_mut(), bay, app.tick);
+    }
+    draw_osd(frame, osd, app);
+}
+
+fn host(url: &str) -> Option<String> {
+    let rest = url.trim().split("://").nth(1).unwrap_or(url.trim());
+    let host = rest.split(['/', '?', '#']).next()?.trim_start_matches("www.");
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// On-screen display, drawn like a VCR's overlay text.
+fn draw_osd(frame: &mut Frame, area: Rect, app: &App) {
+    let bg = theme::BG_DECK;
+    let text = |s: String, fg: Color| {
+        Span::styled(s, Style::new().fg(fg).bg(bg).add_modifier(Modifier::BOLD))
+    };
+    let (glyph, glyph_fg, word) = match app.phase {
+        Phase::Extracting => (
+            if blink(app, 25) { "●" } else { " " },
+            theme::REC,
+            match (app.progress.stage, app.progress.post) {
+                (Stage::Download | Stage::Probe, _) => "REC".to_string(),
+                (stage, Some(p)) => format!("REC  {} {p:.0}%", stage_word(stage)),
+                (stage, None) => format!("REC  {}", stage_word(stage)),
+            },
+        ),
+        Phase::Probing => (
+            "◀◀",
+            if blink(app, 12) { theme::WHITE } else { theme::FG_GHOST },
+            "TRACKING".into(),
+        ),
+        Phase::Ready => ("▌▌", theme::WHITE, "READY".into()),
+        Phase::Done => ("■", theme::OK, "SAVED".into()),
+        Phase::Failed => ("■", theme::REC, "ERROR".into()),
+        _ if app.url.is_empty() => ("▲", theme::FG_DIM, "EJECT".into()),
+        _ => ("■", theme::WHITE, "STOP".into()),
     };
     frame.render_widget(
-        Paragraph::new(label)
-            .style(fill)
-            .alignment(Alignment::Center),
-        inner,
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ", Style::new().bg(bg)),
+            text(glyph.into(), glyph_fg),
+            Span::styled(" ", Style::new().bg(bg)),
+            text(word, theme::WHITE),
+        ]))
+        .style(Style::new().bg(bg)),
+        area,
+    );
+
+    let span = app
+        .trim_range()
+        .map(|(inn, out, _)| out - inn)
+        .or_else(|| app.duration())
+        .unwrap_or(0.0);
+    let counter = (app.deck.pos * span).max(0.0) as u64;
+    let clock = format!(
+        "{}:{:02}:{:02}",
+        counter / 3600,
+        (counter % 3600) / 60,
+        counter % 60
+    );
+    let speed = if app.mode == MediaMode::Audio { "HiFi" } else { "SP" };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            text(speed.into(), theme::FG_DIM),
+            Span::styled("  ", Style::new().bg(bg)),
+            text(clock, theme::VFD),
+            Span::styled(" ", Style::new().bg(bg)),
+        ]))
+        .right_aligned(),
+        area,
     );
 }
 
+fn quality_label(app: &App) -> &'static str {
+    match app.mode {
+        MediaMode::Video => VIDEO_QUALITIES[app.video_quality].label,
+        MediaMode::Audio => AUDIO_QUALITIES[app.audio_quality].label,
+    }
+}
 
+fn container_label(app: &App) -> &'static str {
+    match app.mode {
+        MediaMode::Video => app.video_container.label(),
+        MediaMode::Audio => app.audio_container.label(),
+    }
+}
+
+// ── trim ────────────────────────────────────────────────────────────────
 
 fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
     let dragging = app.trim_drag.is_some();
@@ -381,6 +473,7 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
         Constraint::Min(10),
         Constraint::Length(12),
     ])
+    .spacing(1)
     .split(inner);
 
     app.hits.trim_in = draw_time_box(
@@ -397,7 +490,7 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
         "OUT",
         &app.trim_out,
         app.focus == Focus::TrimOut,
-        "END",
+        "end",
     );
     app.hits.trim_bar = cols[1];
 
@@ -407,78 +500,65 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &mut App) {
         width: cols[1].width,
         height: 1.min(cols[1].height.saturating_sub(1)),
     };
-    if bar.width > 0 {
-        if let Some((inn, out, dur)) = app.trim_range() {
-            let w = bar.width;
-            let mut x0 = util::trim_x(inn, dur, w);
-            let mut x1 = util::trim_x(out, dur, w);
-            if let Some(drag) = app.trim_drag {
-                match drag.handle {
-                    TrimHandle::In => x0 = Some(drag.x.min(w.saturating_sub(1))),
-                    TrimHandle::Out => x1 = Some(drag.x.min(w.saturating_sub(1))),
-                }
-            }
-            let (fill_lo, fill_hi) = match (x0, x1) {
-                (Some(a), Some(b)) => (Some(a.min(b)), Some(a.max(b))),
-                (Some(a), None) => (Some(a), Some(a)),
-                (None, Some(b)) => (Some(b), Some(b)),
-                _ => (None, None),
-            };
-            for i in 0..w {
-                let on_in = x0 == Some(i);
-                let on_out = x1 == Some(i);
-                let in_fill = match (fill_lo, fill_hi) {
-                    (Some(lo), Some(hi)) if i >= lo && i <= hi => true,
-                    _ => false,
-                };
-                let ch = if on_in {
-                    '●'
-                } else if on_out {
-                    '○'
-                } else if in_fill && i != fill_lo.unwrap_or(u16::MAX) && i != fill_hi.unwrap_or(u16::MAX) {
-                    '━'
-                } else {
-                    '─'
-                };
-                let fg = if in_fill || on_in || on_out {
-                    theme::RED
-                } else {
-                    theme::FG_GHOST
-                };
-                if let Some(cell) = frame.buffer_mut().cell_mut((bar.x + i, bar.y)) {
-                    cell.set_char(ch);
-                    cell.fg = fg;
-                    cell.bg = theme::BG;
-                }
-            }
-            if cols[1].height > 2 {
-                let live = if app.focus == Focus::TrimOut {
-                    out
-                } else {
-                    inn
-                };
-                let caption = slider_caption(
-                    w as usize,
-                    &format_timestamp(0.0),
-                    &format_timestamp(live),
-                    &format_timestamp(dur),
-                );
-                frame.render_widget(
-                    Paragraph::new(caption).style(theme::ghost()),
-                    Rect {
-                        x: cols[1].x,
-                        y: cols[1].y.saturating_add(2),
-                        width: cols[1].width,
-                        height: 1,
-                    },
-                );
-            }
-        } else {
-            frame.render_widget(
-                Paragraph::new("PASTE URL TO CUT").style(theme::ghost()),
-                cols[1],
-            );
+    if bar.width == 0 {
+        return;
+    }
+    let Some((inn, out, dur)) = app.trim_range() else {
+        frame.render_widget(
+            Paragraph::new("load a tape to cut it").style(theme::ghost()),
+            bar,
+        );
+        return;
+    };
+    let w = bar.width;
+    let mut x0 = util::trim_x(inn, dur, w);
+    let mut x1 = util::trim_x(out, dur, w);
+    if let Some(drag) = app.trim_drag {
+        match drag.handle {
+            TrimHandle::In => x0 = Some(drag.x.min(w.saturating_sub(1))),
+            TrimHandle::Out => x1 = Some(drag.x.min(w.saturating_sub(1))),
         }
+    }
+    let (lo, hi) = match (x0, x1) {
+        (Some(a), Some(b)) => (a.min(b), a.max(b)),
+        (Some(a), None) | (None, Some(a)) => (a, a),
+        _ => (u16::MAX, u16::MAX),
+    };
+    let active_in = app.focus != Focus::TrimOut;
+    for i in 0..w {
+        let on_in = x0 == Some(i);
+        let on_out = x1 == Some(i);
+        let inside = i >= lo && i <= hi;
+        let (ch, fg) = if on_in {
+            ('●', if active_in { theme::WHITE } else { theme::AMBER })
+        } else if on_out {
+            ('○', if active_in { theme::AMBER } else { theme::WHITE })
+        } else if inside {
+            ('━', theme::AMBER)
+        } else {
+            ('─', theme::BORDER)
+        };
+        let cell = &mut frame.buffer_mut()[(bar.x + i, bar.y)];
+        cell.set_char(ch);
+        cell.fg = fg;
+        cell.bg = theme::BG;
+    }
+    if cols[1].height > 2 {
+        let live = if app.focus == Focus::TrimOut { out } else { inn };
+        let caption = slider_caption(
+            w as usize,
+            &format_timestamp(0.0),
+            &format_timestamp(live),
+            &format_timestamp(dur),
+        );
+        frame.render_widget(
+            Paragraph::new(caption).style(theme::ghost()),
+            Rect {
+                y: cols[1].y.saturating_add(2),
+                height: 1,
+                ..cols[1]
+            },
+        );
     }
 }
 
@@ -494,10 +574,8 @@ fn draw_time_box(
         return area;
     }
     let box_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
         height: area.height.min(3),
+        ..area
     };
     let borders = if box_area.height >= 3 {
         Borders::ALL
@@ -506,28 +584,13 @@ fn draw_time_box(
     };
     let block = Block::bordered()
         .borders(borders)
+        .border_type(BorderType::Rounded)
         .border_style(theme::border(focused))
-        .title(format!(" {title} "))
-        .title_style(theme::title(focused))
-        .style(theme::input(focused));
+        .title(Span::styled(format!(" {title} "), theme::title(focused)))
+        .style(theme::root());
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
-    if inner.width == 0 || inner.height == 0 {
-        return box_area;
-    }
-    let w = inner.width as usize;
-    if field.is_empty() && !focused {
-        frame.render_widget(
-            Paragraph::new(hint).style(Style::new().fg(theme::FG_GHOST).bg(theme::BG_ELEVATED)),
-            inner,
-        );
-    } else {
-        frame.render_widget(Paragraph::new(field_line(field, w, focused)), inner);
-    }
-    if focused {
-        let (_, cur_x) = field.visible(w);
-        frame.set_cursor_position(Position::new(inner.x + cur_x as u16, inner.y));
-    }
+    draw_field(frame, inner, field, focused, hint);
     box_area
 }
 
@@ -556,136 +619,230 @@ fn slider_caption(width: usize, left: &str, mid: &str, right: &str) -> String {
     line.into_iter().collect()
 }
 
-fn draw_right(frame: &mut Frame, area: Rect, app: &mut App) {
-    let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(3),
-        Constraint::Length(3),
-    ])
-    .split(area);
+// ── setup column ────────────────────────────────────────────────────────
 
-    app.hits.playlist = rows[0];
-    draw_labeled(
-        frame,
-        rows[0],
-        "PLAYLIST",
-        app.focus == Focus::Playlist,
-        if app.playlist { "YES" } else { "NO" },
-    );
+fn draw_setup(frame: &mut Frame, area: Rect, app: &mut App) {
+    let rows = Layout::vertical([Constraint::Min(7), Constraint::Length(3)]).split(area);
+    let block = panel("SETUP", false);
+    let inner = block.inner(rows[0]);
+    frame.render_widget(block, rows[0]);
 
-    app.hits.output = rows[1];
-    draw_input(
-        frame,
-        rows[1],
-        "OUTPUT",
-        &app.output,
-        app.focus == Focus::Output,
-        "directory",
-    );
-
-    let fire = panel("ACTION", false);
-    let inner = fire.inner(rows[2]);
-    frame.render_widget(fire, rows[2]);
-    let action = match app.phase {
-        Phase::Extracting => "LIVE LINK",
-        Phase::Probing => "LOCKING",
-        Phase::Done => "LOCKED",
-        Phase::Failed => "FAULT",
-        _ => "F6 EXTRACT",
+    // Stack "label / value" when there is room, otherwise one line each.
+    let stacked = inner.height >= 10;
+    let gap = u16::from(inner.height >= 15);
+    let step = if stacked { 2 + gap } else { 1 };
+    let slot = |i: u16| -> Rect {
+        let y = inner.y + i * step;
+        let h = if stacked { 2 } else { 1 };
+        Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: h.min((inner.y + inner.height).saturating_sub(y)),
+        }
     };
-    let sty = if app.phase == Phase::Done {
-        theme::lock()
-    } else {
-        theme::accent_bold()
+    let value = |r: Rect| -> Rect {
+        if stacked {
+            Rect {
+                x: r.x + 1,
+                y: r.y + 1,
+                width: r.width.saturating_sub(2),
+                height: r.height.saturating_sub(1).min(1),
+            }
+        } else {
+            Rect {
+                x: r.x + 10,
+                width: r.width.saturating_sub(11),
+                ..r
+            }
+        }
     };
-    frame.render_widget(
-        Paragraph::new(action)
-            .style(sty)
-            .alignment(Alignment::Center),
-        inner,
+    let caption = |frame: &mut Frame, r: Rect, text: &str, focused: bool| {
+        if r.height == 0 {
+            return;
+        }
+        let (mark, style) = if focused {
+            ("▸", theme::accent_bold())
+        } else {
+            (" ", theme::ghost())
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(mark, theme::accent()),
+                Span::styled(text.to_string(), style),
+            ])),
+            Rect { height: 1, ..r },
+        );
+    };
+
+    let r = slot(0);
+    app.hits.mode = r;
+    let f = app.focus == Focus::Mode;
+    caption(frame, r, "type", f);
+    draw_chips(
+        frame,
+        value(r),
+        f,
+        &[
+            (MediaMode::Video.label(), app.mode == MediaMode::Video),
+            (MediaMode::Audio.label(), app.mode == MediaMode::Audio),
+        ],
     );
+
+    let r = slot(1);
+    app.hits.container = r;
+    let f = app.focus == Focus::Container;
+    caption(frame, r, "format", f);
+    let items: Vec<(&str, bool)> = match app.mode {
+        MediaMode::Video => crate::engine::VideoContainer::ALL
+            .iter()
+            .map(|c| (c.label(), *c == app.video_container))
+            .collect(),
+        MediaMode::Audio => crate::engine::AudioContainer::ALL
+            .iter()
+            .map(|c| (c.label(), *c == app.audio_container))
+            .collect(),
+    };
+    draw_chips(frame, value(r), f, &items);
+
+    let r = slot(2);
+    app.hits.quality = r;
+    let f = app.focus == Focus::Quality;
+    caption(frame, r, "quality", f);
+    let items: Vec<(&str, bool)> = match app.mode {
+        MediaMode::Video => VIDEO_QUALITIES
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.label, i == app.video_quality))
+            .collect(),
+        MediaMode::Audio => AUDIO_QUALITIES
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.label, i == app.audio_quality))
+            .collect(),
+    };
+    draw_chips(frame, value(r), f, &items);
+
+    let r = slot(3);
+    app.hits.playlist = r;
+    let f = app.focus == Focus::Playlist;
+    caption(frame, r, "playlist", f);
+    draw_chips(frame, value(r), f, &[("OFF", !app.playlist), ("ON", app.playlist)]);
+
+    let r = slot(4);
+    app.hits.output = r;
+    let f = app.focus == Focus::Output;
+    caption(frame, r, "save to", f);
+    draw_field(frame, value(r), &app.output, f, "directory");
+
+    app.hits.download = rows[1];
+    draw_rec_button(frame, rows[1], app);
 }
 
-fn draw_choice(frame: &mut Frame, area: Rect, title: &str, focused: bool, items: &[(&str, bool)]) {
-    let block = panel(title, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if items.is_empty() || inner.width == 0 {
+fn draw_chips(frame: &mut Frame, area: Rect, focused: bool, items: &[(&str, bool)]) {
+    if items.is_empty() || area.width == 0 || area.height == 0 {
         return;
     }
     let selected = items.iter().position(|(_, on)| *on).unwrap_or(0);
-    let chips: Vec<(String, bool)> = items
-        .iter()
-        .map(|(label, on)| {
-            let text = if *on {
-                format!("[{label}]")
-            } else {
-                (*label).to_string()
-            };
-            (text, *on)
-        })
-        .collect();
-    let widths: Vec<usize> = chips.iter().map(|(t, _)| t.len()).collect();
-    let width = inner.width as usize;
-    let (mut lo, hi) = util::choice_window(&widths, selected, width.saturating_sub(2));
-    let mut spans = Vec::new();
-    if lo > 0 {
-        spans.push(Span::styled("<", theme::accent()));
-        if lo == hi && widths.get(lo).copied().unwrap_or(0) + 2 > width {
-            lo = selected;
-        }
-    } else {
-        spans.push(Span::raw(" "));
-    }
-    for i in lo..=hi {
+    let widths: Vec<usize> = items.iter().map(|(l, _)| l.len() + 2).collect();
+    let width = area.width as usize;
+    let (lo, hi) = util::choice_window(&widths, selected, width.saturating_sub(2));
+    let arrow = |on: bool, ch: &'static str| {
+        Span::styled(if on { ch } else { " " }, theme::ghost())
+    };
+    let mut spans = vec![arrow(lo > 0, "‹")];
+    for (i, (label, on)) in items.iter().enumerate().take(hi + 1).skip(lo) {
         if i > lo {
             spans.push(Span::raw(" "));
         }
-        let (text, on) = &chips[i];
-        let sty = if *on {
-            Style::new()
+        let style = match (*on, focused) {
+            (true, true) => Style::new()
                 .fg(theme::BG)
-                .bg(theme::RED)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            theme::dim()
+                .bg(theme::AMBER)
+                .add_modifier(Modifier::BOLD),
+            (true, false) => Style::new()
+                .fg(theme::BG)
+                .bg(theme::FG_DIM)
+                .add_modifier(Modifier::BOLD),
+            _ => theme::dim(),
         };
-        spans.push(Span::styled(text.clone(), sty));
+        spans.push(Span::styled(format!(" {label} "), style));
     }
-    if hi + 1 < chips.len() {
-        spans.push(Span::styled(">", theme::accent()));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    spans.push(arrow(hi + 1 < items.len(), "›"));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_labeled(frame: &mut Frame, area: Rect, title: &str, focused: bool, value: &str) {
-    let block = panel(title, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let sty = if focused {
-        theme::accent_bold()
-    } else {
-        theme::bold()
-    };
-    frame.render_widget(Paragraph::new(value).style(sty), inner);
-}
-
-fn draw_input(frame: &mut Frame, area: Rect, title: &str, field: &Field, focused: bool, hint: &str) {
-    let block = panel(title, focused);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if field.is_empty() && !focused {
-        frame.render_widget(Paragraph::new(hint).style(theme::ghost()), inner);
+/// A chunky record button with half-block shoulders.
+fn draw_rec_button(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height < 3 || area.width < 4 {
         return;
     }
-    let width = inner.width.max(1) as usize;
-    frame.render_widget(Paragraph::new(field_line(field, width, focused)), inner);
-    if focused && inner.width > 0 {
+    let focused = app.focus == Focus::Download;
+    let live = app.phase == Phase::Extracting;
+    let face = if focused || live { theme::REC } else { theme::REC_DEEP };
+    let buf = frame.buffer_mut();
+    for x in area.x + 1..area.x + area.width - 1 {
+        for (dy, ch) in [(0, '▄'), (2, '▀')] {
+            let cell = &mut buf[(x, area.y + dy)];
+            cell.set_char(ch);
+            cell.fg = face;
+            cell.bg = theme::BG;
+        }
+    }
+    let mid = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width - 2,
+        height: 1,
+    };
+    let dot = if live && !blink(app, 25) { " " } else { "●" };
+    let dot_fg = if focused || live { theme::WHITE } else { theme::REC };
+    let label = match app.progress.stage {
+        stage if live && stage.is_post() => stage_word(stage),
+        _ if live => "RECORDING",
+        _ => "DOWNLOAD",
+    };
+    let text_style = Style::new()
+        .fg(if focused || live { theme::WHITE } else { theme::FG })
+        .bg(face)
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(dot, Style::new().fg(dot_fg).bg(face)),
+            Span::styled(format!("  {label}"), text_style),
+        ]))
+        .alignment(Alignment::Center)
+        .style(Style::new().bg(face)),
+        mid,
+    );
+}
+
+// ── inputs ──────────────────────────────────────────────────────────────
+
+fn draw_field(frame: &mut Frame, area: Rect, field: &Field, focused: bool, hint: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let area = Rect { height: 1, ..area };
+    if field.is_empty() && !focused {
+        frame.render_widget(
+            Paragraph::new(format!(" {hint}"))
+                .style(Style::new().fg(theme::FG_GHOST).bg(theme::BG_ELEVATED)),
+            area,
+        );
+        return;
+    }
+    let text = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    frame.render_widget(Block::new().style(theme::input(focused)), area);
+    let width = text.width.max(1) as usize;
+    frame.render_widget(Paragraph::new(field_line(field, width, focused)), text);
+    if focused && text.width > 0 {
         let (_, cur_x) = field.visible(width);
-        frame.set_cursor_position(Position::new(
-            inner.x + cur_x as u16,
-            inner.y,
-        ));
+        frame.set_cursor_position(Position::new(text.x + cur_x as u16, text.y));
     }
 }
 
@@ -695,29 +852,26 @@ fn field_line(field: &Field, width: usize, focused: bool) -> Line<'static> {
     }
     let (start, cur) = field.visible(width);
     let chars = field.chars();
-    let mut spans = Vec::new();
-    for i in 0..width {
-        let idx = start + i;
-        let ch = if idx < chars.len() { chars[idx] } else { ' ' };
-        let is_cur = focused && i == cur;
-        let sty = if is_cur {
-            Style::new().fg(theme::BG).bg(theme::RED)
-        } else {
-            theme::input(focused)
-        };
-        spans.push(Span::styled(ch.to_string(), sty));
-    }
+    let spans: Vec<Span> = (0..width)
+        .map(|i| {
+            let ch = chars.get(start + i).copied().unwrap_or(' ');
+            let style = if focused && i == cur {
+                Style::new().fg(theme::BG).bg(theme::AMBER)
+            } else {
+                theme::input(focused)
+            };
+            Span::styled(ch.to_string(), style)
+        })
+        .collect();
     Line::from(spans)
 }
 
-fn draw_telemetry(frame: &mut Frame, area: Rect, app: &App) {
-    let block = panel("TELEMETRY", false);
+// ── log and tape meter ──────────────────────────────────────────────────
+
+fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
+    let block = panel("LOG", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if app.logs.is_empty() {
-        frame.render_widget(Paragraph::new("SILENT").style(theme::ghost()), inner);
-        return;
-    }
     let h = inner.height as usize;
     let start = app.logs.len().saturating_sub(h);
     let lines: Vec<Line> = app
@@ -725,257 +879,325 @@ fn draw_telemetry(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .skip(start)
         .map(|l| {
-            let sty = if l.contains("ERROR") || l.contains("FAULT") || l.contains("MISSING") {
-                theme::accent()
+            let (clock, msg) = l.split_once("  ").unwrap_or(("", l.as_str()));
+            let fault = msg.contains("ERROR") || msg.contains("FAULT") || msg.contains("MISSING");
+            let style = if fault {
+                Style::new().fg(theme::REC).bg(theme::BG)
+            } else if msg.starts_with("WRITE") || msg.starts_with("LOADED") {
+                theme::root()
             } else {
                 theme::dim()
             };
-            Line::from(Span::styled(
-                util::truncate(l, inner.width as usize),
-                sty,
-            ))
+            let room = (inner.width as usize).saturating_sub(clock.len() + 3);
+            Line::from(vec![
+                Span::styled(format!(" {clock}  "), theme::ghost()),
+                Span::styled(util::truncate(msg, room), style),
+            ])
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_progress(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_tape(frame: &mut Frame, area: Rect, app: &App) {
     let live = app.phase == Phase::Extracting;
-    let done = app.phase == Phase::Done;
-    let failed = app.phase == Phase::Failed;
-    let title = if live {
-        "LINK"
-    } else if done {
-        "LOCK"
-    } else if failed {
-        "FAULT"
-    } else {
-        "METER"
-    };
-    let block = panel(title, live);
+    let post = live && app.progress.stage.is_post();
+    let mut block = panel("TAPE", false);
+    if live {
+        let (step, style) = if post {
+            ("step 2", Style::new().fg(theme::VFD).bg(theme::BG))
+        } else {
+            ("step 1", theme::rec())
+        };
+        block = block.title(
+            Line::from(vec![
+                Span::styled(format!(" {step} · "), theme::ghost()),
+                Span::styled(format!("{} ", stage_word(app.progress.stage)), style),
+            ])
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height == 0 {
+    if inner.height == 0 || inner.width < 4 {
         return;
     }
+    let pad = |r: Rect| Rect {
+        x: r.x + 1,
+        width: r.width.saturating_sub(2),
+        ..r
+    };
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Length(1),
     ])
     .split(inner);
 
-    let (pct, skin) = match app.phase {
-        Phase::Extracting => (app.progress.percent, MeterSkin::Live),
-        Phase::Done => (100.0, MeterSkin::Ok),
-        Phase::Failed => (100.0, MeterSkin::Fault),
-        Phase::Probing => (((app.tick % 40) as f64) * 2.5, MeterSkin::Live),
-        _ => (100.0, MeterSkin::Idle),
+    let (pct, meter) = match app.phase {
+        Phase::Extracting if post => match app.progress.post {
+            Some(p) => (p, Meter::Work),
+            None => (0.0, Meter::Busy),
+        },
+        Phase::Extracting => (app.progress.percent, Meter::Rec),
+        Phase::Done => (100.0, Meter::Done),
+        Phase::Failed => (100.0, Meter::Fault),
+        Phase::Probing => (0.0, Meter::Seek),
+        _ => (0.0, Meter::Idle),
     };
-    effects::render_plasma(frame.buffer_mut(), rows[0], pct, app.tick, skin);
-
-    if live && rows[0].width > 0 {
-        let lead = rows[0].x as f32
-            + (app.progress.percent / 100.0 * f64::from(rows[0].width)) as f32;
-        if app.tick % 2 == 0 {
-            effects::spawn_sparks(
-                &mut app.particles,
-                &mut app.rng,
-                lead,
-                rows[0].y as f32,
-                3,
-            );
-        }
-    }
-
+    let bar = pad(rows[0]);
+    effects::render_meter(frame.buffer_mut(), bar, pct, app.tick, meter);
     let stamp = match app.phase {
+        Phase::Extracting if post => match app.progress.post {
+            Some(p) => format!("{} {}", stage_word(app.progress.stage), format_live_percent(p)),
+            None => stage_word(app.progress.stage).to_string(),
+        },
         Phase::Extracting => format_live_percent(app.progress.percent),
         Phase::Done => "COMPLETE".into(),
         Phase::Failed => "ERROR".into(),
         _ => String::new(),
     };
-    if !stamp.is_empty() {
-        stamp_progress(frame.buffer_mut(), rows[0], &stamp, pct / 100.0, app.phase);
-    }
+    let fill = if meter == Meter::Busy { 0.0 } else { pct / 100.0 };
+    effects::stamp_meter(frame.buffer_mut(), bar, &stamp, fill);
 
-    let meta = match app.phase {
-        Phase::Extracting => format!(
-            "{}  {}  ETA {}  {}",
-            format_live_percent(app.progress.percent),
-            if app.progress.speed.is_empty() {
-                "—"
-            } else {
-                &app.progress.speed
-            },
-            if app.progress.eta.is_empty() {
-                "—"
-            } else {
-                &app.progress.eta
-            },
-            app.progress.total
-        ),
-        Phase::Done => app
-            .last_path
-            .as_ref()
-            .map(|p| format!("COMPLETE  {}", p.display()))
-            .unwrap_or_else(|| "COMPLETE".into()),
-        Phase::Failed => app
-            .last_error
-            .clone()
-            .unwrap_or_else(|| "ERROR".into()),
-        Phase::Probing => "LOCKING TARGET".into(),
-        _ => "STANDBY".into(),
-    };
-    frame.render_widget(Paragraph::new(meta).style(theme::dim()), rows[1]);
-    if rows.len() > 2 {
-        effects::render_waveform(
-            frame.buffer_mut(),
-            rows[2],
-            &app.speed_hist,
-            app.tick,
-            live,
-        );
+    if rows[1].height > 0 {
+        let meta = meta_line(app);
+        frame.render_widget(Paragraph::new(meta), pad(rows[1]));
+    }
+    if rows[2].height > 0 && inner.height >= 3 {
+        effects::render_waveform(frame.buffer_mut(), pad(rows[2]), &app.speed_hist, live);
+    }
+}
+
+fn meta_line(app: &App) -> Line<'static> {
+    let or_dash = |s: &str| if s.is_empty() { "—".to_string() } else { s.to_string() };
+    match app.phase {
+        Phase::Extracting if app.progress.stage.is_post() => {
+            let p = &app.progress;
+            let elapsed = app.stage_started.elapsed().as_secs_f64();
+            let teal = Style::new().fg(theme::VFD).bg(theme::BG);
+            let mut spans = vec![Span::styled(stage_detail(p.stage), teal)];
+            if let Some(pct) = p.post {
+                spans.push(Span::styled(format!("   {}", format_live_percent(pct)), theme::bold()));
+            }
+            spans.push(Span::styled("   elapsed ", theme::ghost()));
+            spans.push(Span::styled(clock_secs(elapsed), theme::root()));
+            match p.post {
+                Some(pct) if pct >= 2.0 && elapsed >= 2.0 => {
+                    let eta = elapsed * (100.0 - pct) / pct;
+                    spans.push(Span::styled("   eta ", theme::ghost()));
+                    spans.push(Span::styled(clock_secs(eta), theme::root()));
+                }
+                Some(_) => {}
+                None => spans.push(Span::styled(
+                    "   long videos take a while here",
+                    theme::ghost(),
+                )),
+            }
+            Line::from(spans)
+        }
+        Phase::Extracting => {
+            let p = &app.progress;
+            let mut spans = vec![
+                Span::styled(format_live_percent(p.percent), theme::bold()),
+                Span::styled("   speed ", theme::ghost()),
+                Span::styled(or_dash(&p.speed), theme::root()),
+                Span::styled("   eta ", theme::ghost()),
+                Span::styled(or_dash(&p.eta), theme::root()),
+            ];
+            if !p.total.is_empty() {
+                spans.push(Span::styled("   size ", theme::ghost()));
+                spans.push(Span::styled(p.total.clone(), theme::root()));
+            }
+            Line::from(spans)
+        }
+        Phase::Done => Line::from(vec![
+            Span::styled("saved  ", theme::ok()),
+            Span::styled(
+                app.last_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                theme::dim(),
+            ),
+        ]),
+        Phase::Failed => Line::from(Span::styled(
+            app.last_error.clone().unwrap_or_else(|| "ERROR".into()),
+            Style::new().fg(theme::REC).bg(theme::BG),
+        )),
+        Phase::Probing => Line::from(Span::styled("reading the tape header…", theme::dim())),
+        Phase::Ready => Line::from(Span::styled(
+            "tape cued — press F6 or DOWNLOAD to record",
+            theme::dim(),
+        )),
+        _ => Line::from(Span::styled("stopped", theme::ghost())),
     }
 }
 
 fn format_live_percent(percent: f64) -> String {
     let p = percent.clamp(0.0, 99.9);
-    if p < 10.0 || p >= 99.0 {
+    if !(10.0..99.0).contains(&p) {
         format!("{p:.1}%")
     } else {
         format!("{p:.0}%")
     }
 }
 
-fn stamp_progress(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str, fill: f64, phase: Phase) {
-    if area.width == 0 || text.is_empty() {
-        return;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let w = chars.len() as u16;
-    let start = area.x + area.width.saturating_sub(w) / 2;
-    let lead = area.x + (fill.clamp(0.0, 1.0) * f64::from(area.width)).round() as u16;
-    for (i, ch) in chars.into_iter().enumerate() {
-        let x = start.saturating_add(i as u16);
-        if x >= area.x.saturating_add(area.width) {
-            break;
-        }
-        let Some(cell) = buf.cell_mut((x, area.y)) else {
-            continue;
-        };
-        cell.set_char(ch);
-        match phase {
-            Phase::Done => {
-                cell.fg = theme::BG;
-                cell.bg = theme::GREEN;
-            }
-            Phase::Failed => {
-                cell.fg = theme::WHITE;
-                cell.bg = theme::RED;
-            }
-            _ => {
-                if x < lead {
-                    cell.fg = theme::WHITE;
-                    cell.bg = theme::RED;
-                } else {
-                    cell.fg = theme::RED;
-                    cell.bg = theme::BG;
-                }
-            }
-        }
-    }
-}
+// ── keys, help, boot ────────────────────────────────────────────────────
 
 fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if app.phase == Phase::Extracting {
-        " ESC ABORT   Q QUIT   /// LIVE DATA LINK /// "
+    let keys: &[(&str, &str)] = if app.phase == Phase::Extracting {
+        &[("esc", "stop"), ("q", "quit")]
+    } else if app.update_available.is_some() {
+        &[
+            ("u", "update"),
+            ("tab", "focus"),
+            ("enter", "load"),
+            ("f6", "rec"),
+            ("m", "type"),
+            ("[ ]", "trim"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
     } else {
-        if app.update_available.is_some() {
-            " U UPDATE  TAB FOCUS  ENTER LOCK  F5 LOCK  F6 EXTRACT  M TYPE  [ ] TRIM  ? HELP  Q QUIT "
-        } else {
-            " TAB FOCUS  ENTER LOCK  F5 LOCK  F6 EXTRACT  M TYPE  [ ] TRIM  ? HELP  Q QUIT "
-        }
+        &[
+            ("tab", "focus"),
+            ("enter", "load"),
+            ("f6", "rec"),
+            ("m", "type"),
+            ("[ ]", "trim"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
     };
+    let mut spans = Vec::new();
+    for (i, (k, v)) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("   ", theme::ghost()));
+        }
+        spans.push(Span::styled(*k, theme::dim()));
+        spans.push(Span::styled(format!(" {v}"), theme::ghost()));
+    }
     frame.render_widget(
-        Paragraph::new(text)
-            .style(theme::ghost())
-            .alignment(Alignment::Center),
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
         area,
     );
 }
 
-fn draw_boot(frame: &mut Frame, area: Rect, app: &App) {
-    let popup = centered(area, 64, 16);
-    frame.render_widget(Clear, popup);
-    let block = Block::bordered()
-        .border_style(theme::accent())
-        .title(" BIOS ")
-        .title_style(theme::accent_bold())
-        .style(theme::root());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let elapsed = app.started.elapsed().as_millis();
-    let mut lines = vec![
-        Line::from(Span::styled("N I T R A T E", theme::accent_bold())),
-        Line::from(Span::styled("VIDEO EXTRACTION CONSOLE", theme::bold())),
-        Line::from(""),
-    ];
-    let checks = [
-        (200, "PHOSPHOR DRIVER", true),
-        (400, "CROSSTERM BACKEND", true),
-        (700, "YT-DLP BRIDGE", app.tools.ytdlp.is_some()),
-        (1000, "FFMPEG BRIDGE", app.tools.ffmpeg.is_some()),
-        (1300, "AWAITING TARGET URL", true),
-    ];
-    for (at, name, ok) in checks {
-        if elapsed >= at {
-            let mark = if ok { "OK" } else { "FAIL" };
-            let sty = if ok { theme::dim() } else { theme::accent() };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{name:<22}"), theme::root()),
-                Span::styled(".... ", theme::ghost()),
-                Span::styled(mark, sty),
-            ]));
-        }
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("PRESS ANY KEY", theme::ghost())));
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 72, 21);
+    let popup = centered(area, 70, 20);
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
-        .border_style(theme::accent())
-        .title(" MANUAL ")
-        .title_style(theme::accent_bold())
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::AMBER_DIM).bg(theme::BG))
+        .title(Span::styled(" MANUAL ", theme::accent_bold()))
         .style(theme::root());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
+    let entry = |k: &str, v: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<20}"), theme::accent()),
+            Span::styled(v.to_string(), theme::root()),
+        ])
+    };
     let text = vec![
-        Line::from(Span::styled("NITRATE  /  YOUTUBE  X  FACEBOOK", theme::accent_bold())),
+        Line::from(Span::styled(
+            "  NITRATE — YouTube · X · Facebook",
+            theme::bold(),
+        )),
         Line::from(""),
-        Line::from("F5 / ENTER ON URL     LOCK metadata via yt-dlp"),
-        Line::from("F6 / DOWNLOAD          start extract with quality + trim"),
-        Line::from("TAB / SHIFT-TAB       cycle focus"),
-        Line::from("M  TYPE               VIDEO or AUDIO"),
-        Line::from("← → on QUALITY        MAX..360P or BEST..64K"),
-        Line::from("← → on FORMAT         MP4 MKV WEBM MOV / MP3 M4A OPUS FLAC WAV OGG AAC"),
-        Line::from("[ ] { }               nudge trim 1s / 5s"),
-        Line::from("DRAG ● / ○            range on full video   RIGHT-CLICK sets OUT"),
-        Line::from("CTRL-U / CTRL-W       clear field / kill word"),
-        Line::from("U / nitrate update    apply latest GitHub release"),
-        Line::from("ESC                   abort live job"),
-        Line::from("Q / CTRL-C            quit"),
+        entry("paste / enter", "load the tape (reads metadata via yt-dlp)"),
+        entry("f6 / download", "record with the chosen quality and trim"),
+        entry("tab / shift-tab", "move focus"),
+        entry("m", "switch video / audio"),
+        entry("← → on a setting", "cycle format, quality, playlist"),
+        entry("[ ]  { }", "nudge trim by 1s / 5s"),
+        entry("drag ● / ○", "set the cut   right-click sets OUT"),
+        entry("ctrl-u / ctrl-w", "clear field / delete word"),
+        entry("u", "apply the latest release"),
+        entry("esc", "stop recording"),
+        entry("q / ctrl-c", "quit"),
         Line::from(""),
         Line::from(Span::styled(
-            "TRIM uses yt-dlp --download-sections. ffmpeg required to merge.",
+            "  Trim uses yt-dlp --download-sections. ffmpeg is needed to merge.",
             theme::ghost(),
         )),
     ];
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// Power-on: a burst of static, then the VCR's blue screen.
+fn draw_boot(frame: &mut Frame, area: Rect, app: &App) {
+    let elapsed = app.started.elapsed();
+    let ms = elapsed.as_millis();
+    let buf = frame.buffer_mut();
+    if ms < 380 {
+        let strength = 1.0 - ms as f32 / 900.0;
+        effects::render_snow(buf, area, app.tick, strength);
+        return;
+    }
+    let blue = theme::BLUE;
+    let fg = theme::WHITE;
+    let soft = theme::mix(blue, theme::WHITE, 0.55);
+    frame.render_widget(Block::new().style(Style::new().bg(blue)), area);
+    let bold = Style::new().fg(fg).bg(blue).add_modifier(Modifier::BOLD);
+    let plain = Style::new().fg(soft).bg(blue);
+
+    let buf = frame.buffer_mut();
+    buf.set_string(area.x + 3, area.y + 1, "▶ PLAY", bold);
+    let ch = "CH 03";
+    buf.set_string(area.x + area.width.saturating_sub(ch.len() as u16 + 3), area.y + 1, ch, bold);
+
+    let top = area.y + area.height.saturating_sub(18) / 2 + 1;
+    let mark = vhs::render_wordmark(
+        buf,
+        Rect {
+            y: top,
+            height: 6,
+            ..area
+        },
+        "NITRATE",
+        fg,
+        blue,
+    );
+    let mut y = top + mark.height.max(1) + 1;
+    let center = |buf: &mut ratatui::buffer::Buffer, y: u16, s: &str, style: Style| {
+        let w = unicode_width::UnicodeWidthStr::width(s) as u16;
+        if y < area.y + area.height {
+            buf.set_string(area.x + area.width.saturating_sub(w) / 2, y, s, style);
+        }
+    };
+    center(buf, y, "VIDEO CASSETTE RECORDER", plain);
+    y += 2;
+
+    let checks = [
+        (500, "video heads", true),
+        (750, "tape transport", true),
+        (1000, "yt-dlp", app.tools.ytdlp.is_some()),
+        (1250, "ffmpeg", app.tools.ffmpeg.is_some()),
+    ];
+    for (at, name, ok) in checks {
+        if ms >= at {
+            let line = format!("{name:<16}{:>6}", if ok { "OK" } else { "MISSING" });
+            let style = if ok { plain } else { bold.fg(theme::STRIPES[2]) };
+            center(buf, y, &line, style);
+        }
+        y += 1;
+    }
+    if ms >= 1500 && blink(app, 30) {
+        center(buf, y + 1, "press any key", plain);
+    }
+
+    let counter = format!("SP  {}", clock(elapsed));
+    buf.set_string(area.x + 3, area.y + area.height.saturating_sub(2), counter, bold);
+
+    if ms < 700 {
+        effects::render_tracking(buf, area, app.tick);
+    }
+}
+
+fn clock(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -995,6 +1217,7 @@ mod tests {
     use crate::app::App;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::time::Instant;
 
     fn dump(buf: &ratatui::buffer::Buffer) -> String {
         let mut s = String::new();
@@ -1007,116 +1230,91 @@ mod tests {
         s
     }
 
-    #[test]
-    fn boot_renders_title() {
+    fn render(app: &mut App) -> String {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        dump(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn boot_shows_blue_screen() {
         let mut app = App::new();
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
-        assert!(text.contains("NITRATE"), "{text}");
-        assert!(text.contains("BIOS") || text.contains("VIDEO"), "{text}");
+        app.started = Instant::now() - Duration::from_millis(1600);
+        let text = render(&mut app);
+        assert!(text.contains("PLAY"), "{text}");
+        assert!(text.contains("VIDEO CASSETTE RECORDER"), "{text}");
     }
 
     #[test]
     fn console_renders_after_boot() {
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.skip_boot();
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
+        let text = render(&mut app);
         assert!(text.contains("NITRATE"), "{text}");
         assert!(text.contains("URL"), "{text}");
-        assert!(text.contains("IDENT"), "{text}");
-        assert!(text.contains("TYPE"), "{text}");
-        assert!(text.contains("FORMAT"), "{text}");
-        assert!(text.contains("QUALITY"), "{text}");
+        assert!(text.contains("LABEL"), "{text}");
+        assert!(text.contains("DECK"), "{text}");
+        assert!(text.contains("NO TAPE"), "{text}");
+        assert!(text.contains("type"), "{text}");
+        assert!(text.contains("format"), "{text}");
+        assert!(text.contains("quality"), "{text}");
         assert!(text.contains("DOWNLOAD"), "{text}");
-        assert!(!text.contains("SIGNAL"), "{text}");
         assert!(!text.contains("COOKIES"), "{text}");
     }
 
     #[test]
-    fn ident_shows_signal_title() {
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn label_shows_title_and_cassette_loads() {
         let mut app = App::new();
         app.skip_boot();
+        app.url.set("https://www.youtube.com/watch?v=abc");
         app.info = Some(crate::engine::VideoInfo {
             id: "abc".into(),
-            title: "A VERY LONG VIDEO TITLE THAT MUST SLIDE IN IDENT".into(),
+            title: "A VERY LONG VIDEO TITLE THAT MUST SLIDE IN THE LABEL".into(),
             duration: Some(90.0),
             extractor: "Youtube".into(),
             webpage_url: "https://www.youtube.com/watch?v=abcdefghijklmnop".into(),
             platform: crate::util::Platform::YouTube,
         });
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
-        assert!(text.contains("TTL"), "{text}");
-        assert!(text.contains("IDENT"), "{text}");
+        app.deck.seated = 1.0;
+        let text = render(&mut app);
+        assert!(text.contains("title"), "{text}");
         assert!(text.contains("abc"), "{text}");
-        assert!(text.contains("[MAX]"), "{text}");
+        assert!(text.contains(" MAX "), "{text}");
+        assert!(text.contains("NITRATE HQ"), "{text}");
+        assert!(!text.contains("NO TAPE"), "{text}");
     }
 
     #[test]
     fn progress_bar_shows_percent_complete_and_error() {
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.skip_boot();
 
         app.phase = Phase::Extracting;
         app.progress.percent = 45.0;
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
+        let text = render(&mut app);
         assert!(text.contains("45%"), "{text}");
+        assert!(text.contains("REC"), "{text}");
 
         app.progress.percent = 0.4;
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
-        assert!(text.contains("0.4%"), "{text}");
+        assert!(render(&mut app).contains("0.4%"));
 
         app.phase = Phase::Done;
         app.progress.percent = 100.0;
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
-        assert!(text.contains("COMPLETE"), "{text}");
+        assert!(render(&mut app).contains("COMPLETE"));
 
         app.phase = Phase::Failed;
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
-        assert!(text.contains("ERROR"), "{text}");
+        assert!(render(&mut app).contains("ERROR"));
     }
 
     #[test]
     fn trim_slider_shows_after_url_without_probe() {
-        let backend = TestBackend::new(120, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
         app.skip_boot();
         app.url.set("https://youtu.be/abc");
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
-        let text = dump(terminal.backend().buffer());
+        let text = render(&mut app);
         assert!(text.contains("TRIM"), "{text}");
-        assert!(!text.contains("PASTE URL TO CUT"), "{text}");
-        assert!(!text.contains("LOCK TARGET"), "{text}");
+        assert!(!text.contains("load a tape to cut it"), "{text}");
         assert!(app.trim_range().is_some());
     }
 
@@ -1134,9 +1332,7 @@ mod tests {
             webpage_url: "https://youtu.be/abc".into(),
             platform: crate::util::Platform::YouTube,
         });
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let text = dump(buf);
         let bar = app.hits.trim_bar;
@@ -1149,9 +1345,23 @@ mod tests {
         );
         let inn = app.hits.trim_in;
         let out = app.hits.trim_out;
-        assert_eq!(buf[(inn.x, inn.y)].symbol(), "┌", "{text}");
-        assert_eq!(buf[(out.x, out.y)].symbol(), "┌", "{text}");
+        assert_eq!(buf[(inn.x, inn.y)].symbol(), "╭", "{text}");
+        assert_eq!(buf[(out.x, out.y)].symbol(), "╭", "{text}");
         assert!(text.contains(" IN "), "{text}");
         assert!(text.contains(" OUT "), "{text}");
+    }
+
+    #[test]
+    fn narrow_and_small_terminals_render() {
+        let mut app = App::new();
+        app.skip_boot();
+        app.url.set("https://youtu.be/abc");
+        app.deck.seated = 1.0;
+        app.phase = Phase::Probing;
+        for (w, h) in [(80, 22), (90, 26), (103, 30), (200, 60), (60, 10)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
     }
 }

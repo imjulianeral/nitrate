@@ -5,6 +5,7 @@ mod theme;
 mod ui;
 mod update;
 mod util;
+mod vhs;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,

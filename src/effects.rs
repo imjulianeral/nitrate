@@ -1,238 +1,227 @@
 use crate::theme;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier};
 
-
-#[derive(Clone, Copy, Debug)]
-pub struct Particle {
-    pub x: f32,
-    pub y: f32,
-    pub vx: f32,
-    pub vy: f32,
-    pub life: u16,
-    pub ch: char,
+/// Cheap stable noise in 0..1 for (x, y, t).
+pub fn hash(x: u32, y: u32, t: u32) -> f32 {
+    let mut h = x
+        .wrapping_mul(0x27d4_eb2d)
+        ^ y.wrapping_mul(0x1656_67b1)
+        ^ t.wrapping_mul(0x9e37_79b9);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297a_2d39);
+    h ^= h >> 15;
+    (h & 0xffff) as f32 / 65536.0
 }
 
-pub struct Rng(u64);
-
-impl Rng {
-    pub fn new(seed: u64) -> Self {
-        Self(seed | 1)
+/// A VHS tracking band: a couple of rows roll down, torn sideways and
+/// peppered with noise, the way a misaligned head looks on a CRT.
+pub fn render_tracking(buf: &mut Buffer, area: Rect, tick: u64) {
+    if area.width < 4 || area.height == 0 {
+        return;
     }
-
-    pub fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    pub fn f32(&mut self) -> f32 {
-        (self.next_u64() as f32) / (u64::MAX as f32)
-    }
-
-    pub fn range_f32(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * self.f32()
-    }
-
-    pub fn range_u16(&mut self, lo: u16, hi: u16) -> u16 {
-        if hi <= lo {
-            return lo;
+    let span = i64::from(area.height) + 6;
+    let head = (tick as i64 / 2) % span - 3;
+    for band in 0..2i64 {
+        let row = head + band;
+        if row < 0 || row >= i64::from(area.height) {
+            continue;
         }
-        lo + (self.next_u64() as u16) % (hi - lo)
-    }
-}
-
-pub fn step_particles(particles: &mut Vec<Particle>, bounds: Rect) {
-    for p in particles.iter_mut() {
-        p.x += p.vx;
-        p.y += p.vy;
-        p.vy += 0.04;
-        p.life = p.life.saturating_sub(1);
-    }
-    particles.retain(|p| {
-        p.life > 0
-            && p.x >= bounds.x as f32
-            && p.y >= bounds.y as f32
-            && p.x < (bounds.x + bounds.width) as f32
-            && p.y < (bounds.y + bounds.height) as f32
-    });
-}
-
-pub fn spawn_sparks(
-    particles: &mut Vec<Particle>,
-    rng: &mut Rng,
-    x: f32,
-    y: f32,
-    n: usize,
-) {
-    const CHARS: [char; 4] = ['·', '+', '*', 'o'];
-    for _ in 0..n {
-        if particles.len() >= 120 {
-            break;
+        let y = area.y + row as u16;
+        let t = tick as u32;
+        let tear = 1 + (hash(row as u32, 7, t / 3) * 2.0) as u16;
+        let x0 = area.x;
+        let x1 = area.x + area.width;
+        for x in (x0 + tear..x1).rev() {
+            let src = buf[(x - tear, y)].clone();
+            buf[(x, y)] = src;
         }
-        particles.push(Particle {
-            x: x + rng.range_f32(-0.4, 0.4),
-            y: y + rng.range_f32(-0.2, 0.2),
-            vx: rng.range_f32(-0.35, 0.55),
-            vy: rng.range_f32(-0.45, 0.05),
-            life: rng.range_u16(8, 28),
-            ch: CHARS[(rng.next_u64() as usize) % CHARS.len()],
-        });
-    }
-}
-
-pub fn render_particles(buf: &mut Buffer, particles: &[Particle]) {
-    for p in particles {
-        let x = p.x.round() as u16;
-        let y = p.y.round() as u16;
-        if let Some(cell) = buf.cell_mut((x, y)) {
-            if cell.symbol() == " " {
-                cell.set_char(p.ch);
+        for x in x0..x1 {
+            let n = hash(u32::from(x), u32::from(y), t);
+            let cell = &mut buf[(x, y)];
+            if x < x0 + tear {
+                cell.set_char(' ');
+                cell.bg = theme::BG_DECK;
             }
-            cell.fg = if p.life > 14 {
-                theme::WHITE
-            } else {
-                theme::RED
-            };
+            let lift = if band == 0 { 0.10 } else { 0.05 };
+            cell.bg = theme::mix(cell.bg, theme::WHITE, lift * n);
+            cell.fg = theme::mix(cell.fg, theme::WHITE, 0.25 * n);
+            if n > 0.93 && cell.symbol() == " " {
+                cell.set_char(if n > 0.97 { '▀' } else { '▄' });
+                cell.fg = theme::mix(cell.bg, theme::WHITE, 0.35);
+            }
+        }
+    }
+}
+
+/// Broadband static, for the moment the set warms up.
+pub fn render_snow(buf: &mut Buffer, area: Rect, tick: u64, strength: f32) {
+    const GRAIN: [char; 4] = [' ', '░', '▒', '▓'];
+    let t = tick as u32;
+    for y in area.y..area.y + area.height {
+        // Each scanline breathes a little, like an untuned channel.
+        let line = 0.6 + 0.4 * hash(0, u32::from(y), t / 2);
+        for x in area.x..area.x + area.width {
+            let n = hash(u32::from(x), u32::from(y), t) * line * strength;
+            let cell = &mut buf[(x, y)];
+            cell.set_char(GRAIN[((n * 4.0) as usize).min(3)]);
+            let v = (40.0 + n * 150.0) as u8;
+            cell.fg = Color::Rgb(v, v, v.saturating_add(6));
+            cell.bg = Color::Rgb(12, 12, 14);
+            cell.modifier = Modifier::empty();
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MeterSkin {
+pub enum Meter {
     Idle,
-    Live,
-    Ok,
+    Seek,
+    Rec,
+    /// Post-processing with a known completion.
+    Work,
+    /// Post-processing that reports nothing; sweep to show it is alive.
+    Busy,
+    Done,
     Fault,
 }
 
-pub fn render_plasma(buf: &mut Buffer, area: Rect, pct: f64, tick: u64, skin: MeterSkin) {
+/// Tape position meter with eighth-block precision.
+pub fn render_meter(buf: &mut Buffer, area: Rect, pct: f64, tick: u64, meter: Meter) {
+    const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let pct = match skin {
-        MeterSkin::Ok | MeterSkin::Fault => 1.0,
-        _ => pct.clamp(0.0, 100.0) / 100.0,
+    let track = theme::BG_ELEVATED;
+    let fill = match meter {
+        Meter::Done => theme::OK,
+        Meter::Fault => theme::REC,
+        Meter::Work | Meter::Busy => theme::VFD,
+        _ => theme::AMBER,
     };
-    let lead = (pct * f64::from(area.width)).round() as i32;
-    let t = tick as f64;
-    let live = skin == MeterSkin::Live;
-    let (fill, fill_dim, fill_bg) = match skin {
-        MeterSkin::Ok => (
-            theme::GREEN,
-            theme::dim_rgb(theme::GREEN, 70),
-            theme::dim_rgb(theme::GREEN, 170),
-        ),
-        MeterSkin::Fault => (theme::RED, theme::RED_DIM, theme::RED_DEEP),
-        _ => (theme::RED, theme::RED_DIM, theme::RED_DEEP),
+    let w = f64::from(area.width);
+    let (from, to) = match meter {
+        Meter::Idle => (0.0, 0.0),
+        Meter::Done | Meter::Fault => (0.0, w),
+        Meter::Rec | Meter::Work => (0.0, pct.clamp(0.0, 100.0) / 100.0 * w),
+        Meter::Seek | Meter::Busy => {
+            // A read head sweeping back and forth while the tape is cued.
+            let span = (w * 0.18).max(3.0);
+            let travel = (w - span).max(0.0);
+            let phase = (tick as f64 * 0.035).sin() * 0.5 + 0.5;
+            let a = phase * travel;
+            (a, a + span)
+        }
     };
+    let y = area.y;
     for i in 0..area.width {
-        let x = area.x + i;
-        let filled = i32::from(i) < lead;
-        let wave = ((f64::from(i) * 0.42 + t * 0.16).sin() + 1.0) * 0.5;
-        let dist = (i32::from(i) - lead).unsigned_abs();
-        let spark = live && dist < 2;
-        let ch = if spark {
-            '▓'
-        } else if filled {
-            if wave > 0.75 {
-                '█'
-            } else if wave > 0.45 {
-                '▓'
-            } else {
-                '▒'
+        let cx = f64::from(i);
+        let cover = ((to - cx).min(1.0) - (from - cx).max(0.0)).clamp(0.0, 1.0);
+        let lit = match meter {
+            Meter::Rec | Meter::Work => {
+                let wave = ((cx * 0.22 - tick as f64 * 0.12).sin() * 0.5 + 0.5) as f32;
+                theme::mix(theme::scale(fill, 0.82), fill, wave)
             }
-        } else if live && wave > 0.92 {
-            '░'
-        } else {
-            '─'
+            _ => fill,
         };
-        let fg = if spark {
-            theme::WHITE
-        } else if filled {
-            if wave > 0.7 {
-                fill
-            } else {
-                fill_dim
-            }
+        let cell = &mut buf[(area.x + i, y)];
+        cell.modifier = Modifier::empty();
+        if cover >= 1.0 {
+            cell.set_char(' ');
+            cell.bg = lit;
+        } else if cover <= 0.0 {
+            cell.set_char(' ');
+            cell.bg = track;
+        } else if from > cx {
+            // Leading edge of the seek window: fill from the right.
+            cell.set_char(EIGHTHS[((1.0 - cover) * 8.0).round().clamp(0.0, 7.0) as usize]);
+            cell.fg = track;
+            cell.bg = lit;
         } else {
-            theme::FG_GHOST
-        };
-        let bg = if filled { fill_bg } else { theme::BG };
-        for dy in 0..area.height {
-            if let Some(cell) = buf.cell_mut((x, area.y + dy)) {
-                if dy == 0 || area.height == 1 {
-                    cell.set_char(ch);
-                    cell.fg = fg;
-                    cell.bg = bg;
-                } else {
-                    cell.set_char(if filled { '▄' } else { ' ' });
-                    cell.fg = theme::dim_rgb(fg, 40);
-                    cell.bg = bg;
-                }
-            }
+            cell.set_char(EIGHTHS[(cover * 8.0).round().clamp(0.0, 7.0) as usize]);
+            cell.fg = lit;
+            cell.bg = track;
         }
     }
 }
 
-pub fn render_waveform(buf: &mut Buffer, area: Rect, samples: &[u64], tick: u64, live: bool) {
-    if area.width == 0 || area.height == 0 {
+/// Stamp `text` centred on the meter, inverted where it crosses the fill.
+pub fn stamp_meter(buf: &mut Buffer, area: Rect, text: &str, fill: f64) {
+    if area.width == 0 || text.is_empty() {
         return;
     }
+    let len = text.chars().count() as u16;
+    let start = area.x + area.width.saturating_sub(len) / 2;
+    let lead = area.x as f64 + fill.clamp(0.0, 1.0) * f64::from(area.width);
+    for (i, ch) in text.chars().enumerate() {
+        let x = start + i as u16;
+        if x >= area.x + area.width {
+            break;
+        }
+        let cell = &mut buf[(x, area.y)];
+        let on_fill = f64::from(x) + 0.5 < lead;
+        cell.set_char(ch);
+        cell.modifier = Modifier::BOLD;
+        if on_fill {
+            cell.fg = theme::BG;
+        } else {
+            cell.fg = theme::FG;
+            cell.bg = theme::BG_ELEVATED;
+        }
+    }
+}
+
+/// Transfer-rate history as a thin trace under the meter.
+pub fn render_waveform(buf: &mut Buffer, area: Rect, samples: &[u64], live: bool) {
     const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let max = samples.iter().copied().max().unwrap_or(1).max(1);
-    for i in 0..area.width {
-        let ch = if !samples.is_empty() {
-            let idx = if samples.len() >= area.width as usize {
-                samples.len() - area.width as usize + i as usize
-            } else if (i as usize) < samples.len() {
-                i as usize
-            } else {
-                usize::MAX
-            };
-            if idx < samples.len() {
-                let n = ((samples[idx] as f64 / max as f64) * 8.0).round() as usize;
-                BLOCKS[n.min(8)]
-            } else if live {
-                let wave = (f64::from(i) * 0.31 + tick as f64 * 0.11).sin();
-                let n = ((wave + 1.0) * 3.5).round() as usize;
-                BLOCKS[n.min(8)]
-            } else {
-                '▁'
-            }
-        } else if live {
-            let wave = (f64::from(i) * 0.31 + tick as f64 * 0.11).sin();
-            let n = ((wave + 1.0) * 3.5).round() as usize;
-            BLOCKS[n.min(8)]
-        } else {
-            '▁'
-        };
-        if let Some(cell) = buf.cell_mut((area.x + i, area.y)) {
-            cell.set_char(ch);
-            cell.fg = if live { theme::RED } else { theme::FG_GHOST };
-            cell.bg = theme::BG;
-        }
-    }
-}
-
-pub fn render_hazard(buf: &mut Buffer, area: Rect, tick: u64) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let off = (tick / 2) as u16;
-    for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            let on = ((x + off) / 2) % 2 == 0;
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_char(if on { '▀' } else { ' ' });
-                cell.fg = theme::RED;
-                cell.bg = if on { theme::RED_DEEP } else { theme::BG };
+    let max = samples.iter().copied().max().unwrap_or(1).max(1);
+    let w = area.width as usize;
+    let n = samples.len();
+    for i in 0..w {
+        // Stretch the history over the full width, interpolating between
+        // samples, so the trace spans the meter however few samples exist.
+        let level = match n {
+            0 => 1,
+            1 => 8,
+            _ => {
+                let t = i as f64 / (w - 1).max(1) as f64 * (n - 1) as f64;
+                let (a, frac) = (t.floor() as usize, t.fract());
+                let b = (a + 1).min(n - 1);
+                let v = samples[a] as f64 * (1.0 - frac) + samples[b] as f64 * frac;
+                ((v / max as f64 * 8.0).round() as usize).max(1)
             }
-        }
+        };
+        let cell = &mut buf[(area.x + i as u16, area.y)];
+        cell.set_char(BLOCKS[level.min(8)]);
+        cell.fg = if live && n > 0 {
+            theme::AMBER_DIM
+        } else {
+            theme::BORDER
+        };
+        cell.bg = theme::BG;
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn waveform_spans_full_width_with_few_samples() {
+        let area = Rect::new(0, 0, 150, 1);
+        let mut buf = Buffer::empty(area);
+        let samples: Vec<u64> = (0..96).map(|i| 100 + (i % 7) * 40).collect();
+        render_waveform(&mut buf, area, &samples, true);
+        for x in 0..area.width {
+            assert_eq!(buf[(x, 0)].fg, theme::AMBER_DIM, "column {x}");
+        }
+        let tail: Vec<&str> = (140..150).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(tail.iter().any(|s| *s != "▁"), "{tail:?}");
+    }
+}

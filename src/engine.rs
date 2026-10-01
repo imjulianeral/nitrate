@@ -1,13 +1,13 @@
 use crate::util::{parse_yt_size, Platform};
 use serde_json::Value;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaMode {
@@ -489,6 +489,11 @@ impl Stage {
             Self::Finalize => "WRITE",
         }
     }
+
+    /// Work yt-dlp does after the bytes are in: ffmpeg muxing and fixups.
+    pub fn is_post(self) -> bool {
+        matches!(self, Self::Merge | Self::Convert | Self::Trim | Self::Finalize)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -499,6 +504,8 @@ pub struct Progress {
     pub total: String,
     pub speed_bps: u64,
     pub stage: Stage,
+    /// Post-processing completion, 0..100; None while it cannot be measured.
+    pub post: Option<f64>,
     pub filename: String,
     pub downloaded: u64,
     pub total_bytes: u64,
@@ -570,7 +577,13 @@ fn progress_template() -> String {
     .into()
 }
 
-pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
+/// ffmpeg `-progress` target, quoted for yt-dlp's shlex-split `--ppa`.
+fn progress_arg(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy().replace('\\', "/");
+    (!s.contains('\'')).then(|| format!("-progress 'file:{s}'"))
+}
+
+pub fn build_ytdlp_args(spec: &JobSpec, progress_file: Option<&Path>) -> Vec<String> {
     let mut args = vec![
         "--color".into(),
         "never".into(),
@@ -580,6 +593,10 @@ pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
         // progress.percent is not a yt-dlp field; it renders NA and replaces
         // the default [download] line, so the meter never moves.
         progress_template(),
+        // --print below implies --quiet, which hides "[Merger] Merging ...".
+        // Post-processor progress is printed regardless, so track steps here.
+        "--progress-template".into(),
+        "postprocess:NITRATE_PP:%(progress.status)s|%(progress.postprocessor)s".into(),
     ];
     args.extend(js_runtime_args());
     if let Some(ff) = spec.ffmpeg.as_ref() {
@@ -590,6 +607,14 @@ pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
         args.push("--yes-playlist".into());
     } else {
         args.push("--no-playlist".into());
+    }
+
+    // yt-dlp runs its ffmpeg post-processors with output captured, so a long
+    // merge looks frozen. -progress makes ffmpeg report into a file we tail.
+    let progress = progress_file.and_then(progress_arg);
+    if let Some(p) = progress.as_ref() {
+        args.push("--postprocessor-args".into());
+        args.push(format!("default:{p}"));
     }
 
     match spec.mode {
@@ -618,8 +643,14 @@ pub fn build_ytdlp_args(spec: &JobSpec) -> Vec<String> {
                 spec.video_container,
                 VideoContainer::Mp4 | VideoContainer::Mov
             ) {
+                // A specific key replaces "default", so repeat -progress here.
+                let mut merger = "Merger:-c:v copy -c:a aac -movflags +faststart".to_string();
+                if let Some(p) = progress.as_ref() {
+                    merger.push(' ');
+                    merger.push_str(p);
+                }
                 args.push("--postprocessor-args".into());
-                args.push("Merger:-c:v copy -c:a aac -movflags +faststart".into());
+                args.push(merger);
             }
         }
     }
@@ -699,6 +730,7 @@ pub fn spawn_probe(
                     last_err = line.to_string();
                     let _ = tx.send(EngineEvent::Log(line.to_string()));
                 }
+                Pipe::Tick => {}
             }) {
                 Ok(s) => s,
                 Err(e) => {
@@ -746,7 +778,15 @@ pub fn spawn_download(
                 let _ = tx.send(EngineEvent::JobDone(Err(format!("OUTPUT DIR: {e}"))));
                 return;
             }
-            let args = build_ytdlp_args(&spec);
+            let progress_file = std::env::temp_dir().join(format!(
+                "nitrate-{}-{}.progress",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let args = build_ytdlp_args(&spec, Some(&progress_file));
             if let Some(sel) = args
                 .windows(2)
                 .find(|w| w[0] == "-f")
@@ -763,16 +803,49 @@ pub fn spawn_download(
                 total: String::new(),
                 speed_bps: 0,
                 stage: Stage::Download,
+        post: None,
                 filename: String::new(),
                 downloaded: 0,
                 total_bytes: 0,
             };
             let mut meter = DownloadMeter::default();
+            let mut post = PostWatch::new(progress_file.clone(), output_span(&spec));
+            let mut fetched = false;
 
             let tools_dir = spec.ffmpeg.as_ref().and_then(|p| p.parent()).map(|p| p.to_path_buf());
-            let status = match run_streaming(&ytdlp, &args, &kill, tools_dir.as_deref(), |_, line| {
+            let status = match run_streaming(&ytdlp, &args, &kill, tools_dir.as_deref(), |pipe, line| {
+                if let Pipe::Tick = pipe {
+                    if progress.stage.is_post() {
+                        let (stage, pct) = post.poll(progress.stage, meter.total_bytes());
+                        if stage != progress.stage || pct != progress.post {
+                            progress.stage = stage;
+                            progress.post = pct;
+                            let _ = tx.send(EngineEvent::Progress(progress.clone()));
+                        }
+                    }
+                    return;
+                }
+                let mut enter = |stage: Stage, progress: &mut Progress| {
+                    if stage.is_post() && !progress.stage.is_post() {
+                        // Every byte is in; what remains is local work.
+                        progress.percent = 100.0;
+                        progress.speed.clear();
+                        progress.eta.clear();
+                    }
+                    if stage.is_post() {
+                        post.begin();
+                    }
+                    let changed = stage != progress.stage;
+                    progress.stage = stage;
+                    progress.post = None;
+                    let _ = tx.send(EngineEvent::Progress(progress.clone()));
+                    if changed {
+                        let _ = tx.send(EngineEvent::Log(stage.label().into()));
+                    }
+                };
                 match interpret_line(line) {
                     LineKind::Progress(p) => {
+                        fetched = true;
                         let (overall, sizes) = meter.observe(&p);
                         progress.percent = overall;
                         progress.downloaded = p.downloaded;
@@ -795,9 +868,11 @@ pub fn spawn_download(
                             progress.speed_bps = p.speed_bps;
                         }
                         progress.stage = Stage::Download;
+                        progress.post = None;
                         let _ = tx.send(EngineEvent::Progress(progress.clone()));
                     }
                     LineKind::MediaTime(sec) => {
+                        fetched = true;
                         if let Some(dur) = spec.duration.filter(|d| *d > 0.2) {
                             progress.percent = (sec / dur * 100.0).clamp(0.0, 99.9);
                             progress.stage = Stage::Download;
@@ -813,13 +888,13 @@ pub fn spawn_download(
                         dest = Some(PathBuf::from(&path));
                         progress.filename = path;
                     }
-                    LineKind::Stage(stage) => {
-                        progress.stage = stage;
-                        if stage == Stage::Merge {
-                            progress.percent = progress.percent.max(90.0);
-                        }
-                        let _ = tx.send(EngineEvent::Progress(progress.clone()));
-                        let _ = tx.send(EngineEvent::Log(stage.label().into()));
+                    // Pre-download post-processors are not the second step.
+                    LineKind::Stage(stage) if stage.is_post() && !fetched => {}
+                    LineKind::Stage(stage) => enter(stage, &mut progress),
+                    LineKind::StageDest(stage, path) => {
+                        dest = Some(PathBuf::from(&path));
+                        progress.filename = path;
+                        enter(stage, &mut progress);
                     }
                     LineKind::Error(msg) => {
                         last_err = msg.clone();
@@ -837,6 +912,7 @@ pub fn spawn_download(
                 }
             };
 
+            let _ = std::fs::remove_file(&progress_file);
             if kill.load(Ordering::Relaxed) {
                 let _ = tx.send(EngineEvent::JobDone(Err("ABORTED".into())));
                 return;
@@ -862,6 +938,8 @@ pub fn spawn_download(
 enum Pipe {
     Out,
     Err,
+    /// Heartbeat while the child runs, for polling side channels.
+    Tick,
 }
 
 fn run_streaming(
@@ -907,12 +985,17 @@ fn pump(
     spawn_pipe_reader(stdout, tx.clone(), Pipe::Out);
     spawn_pipe_reader(stderr, tx, Pipe::Err);
 
+    let mut beat = Instant::now();
     loop {
         if kill.load(Ordering::Relaxed) {
             kill_child(child);
         }
         while let Ok((pipe, line)) = rx.try_recv() {
             on_line(pipe, &line);
+        }
+        if beat.elapsed() >= Duration::from_millis(250) {
+            beat = Instant::now();
+            on_line(Pipe::Tick, "");
         }
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -979,6 +1062,7 @@ pub enum LineKind {
     Destination(String),
     OutputPath(String),
     Stage(Stage),
+    StageDest(Stage, String),
     Error(String),
     Log(String),
 }
@@ -991,6 +1075,16 @@ pub fn interpret_line(line: &str) -> LineKind {
     }
     if let Some(path) = t.strip_prefix("NITRATE_OUT:") {
         return LineKind::OutputPath(path.trim().to_string());
+    }
+    if let Some(rest) = t.strip_prefix("NITRATE_PP:") {
+        let (status, name) = rest.split_once('|').unwrap_or((rest, ""));
+        // Between steps (and in MoveFiles) yt-dlp is only shuffling files.
+        let stage = if status.trim() == "started" {
+            post_stage(name.trim())
+        } else {
+            Stage::Finalize
+        };
+        return LineKind::Stage(stage);
     }
     if let Some(rest) = t.strip_prefix("NITRATE_PCT:") {
         if let Some(p) = parse_template_progress(rest) {
@@ -1011,13 +1105,13 @@ pub fn interpret_line(line: &str) -> LineKind {
     }
     if t.starts_with("[Merger]") {
         if let Some(path) = quoted_path(t) {
-            return LineKind::Destination(path);
+            return LineKind::StageDest(Stage::Merge, path);
         }
         return LineKind::Stage(Stage::Merge);
     }
     if t.starts_with("[ExtractAudio]") {
         if let Some(dest) = t.split_once("Destination:").map(|(_, d)| d.trim()) {
-            return LineKind::Destination(dest.to_string());
+            return LineKind::StageDest(Stage::Convert, dest.to_string());
         }
         return LineKind::Stage(Stage::Convert);
     }
@@ -1042,6 +1136,16 @@ pub fn interpret_line(line: &str) -> LineKind {
         }
     }
     LineKind::Log(t.to_string())
+}
+
+/// Map a yt-dlp post-processor key to the step shown to the user.
+fn post_stage(pp: &str) -> Stage {
+    match pp {
+        "Merger" => Stage::Merge,
+        "ExtractAudio" | "VideoConvertor" | "VideoRemuxer" => Stage::Convert,
+        "ModifyChapters" | "SplitChapters" => Stage::Trim,
+        _ => Stage::Finalize,
+    }
 }
 
 fn parse_template_progress(rest: &str) -> Option<Progress> {
@@ -1071,6 +1175,7 @@ fn parse_template_progress(rest: &str) -> Option<Progress> {
         total: String::new(),
         speed_bps,
         stage: Stage::Download,
+        post: None,
         filename: String::new(),
         downloaded: 0,
         total_bytes: 0,
@@ -1122,6 +1227,7 @@ fn parse_pipe_progress(rest: &str) -> Option<Progress> {
         total: total_label,
         speed_bps,
         stage: Stage::Download,
+        post: None,
         filename,
         downloaded,
         total_bytes,
@@ -1295,6 +1401,10 @@ impl DownloadMeter {
         (sum / self.files.len() as f64).clamp(0.0, 99.9)
     }
 
+    fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.total).sum()
+    }
+
     fn size_label(&self) -> String {
         let dl: u128 = self.files.iter().map(|f| f.downloaded as u128).sum();
         let tot: u128 = self.files.iter().map(|f| f.total as u128).sum();
@@ -1303,6 +1413,123 @@ impl DownloadMeter {
         }
         format!("{}/{}", format_bytes(dl as u64), format_bytes(tot as u64))
     }
+}
+
+/// Length of media the post-processors will write, if known.
+fn output_span(spec: &JobSpec) -> Option<f64> {
+    let start = spec.trim_in.filter(|v| v.is_finite()).unwrap_or(0.0).max(0.0);
+    let end = spec
+        .trim_out
+        .filter(|v| v.is_finite())
+        .or(spec.duration)
+        .filter(|v| v.is_finite())?;
+    (end - start > 0.5).then_some(end - start)
+}
+
+/// Latest block of an ffmpeg `-progress` report.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FfReport {
+    out_secs: Option<f64>,
+    size: Option<u64>,
+    ended: bool,
+}
+
+fn parse_ff_report(s: &str) -> Option<FfReport> {
+    let mut cur = FfReport::default();
+    let mut done = None;
+    for line in s.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim() {
+            // out_time_ms is microseconds too, an old ffmpeg naming slip.
+            "out_time_us" | "out_time_ms" => {
+                if let Ok(us) = v.parse::<i64>() {
+                    if us >= 0 {
+                        cur.out_secs = Some(us as f64 / 1_000_000.0);
+                    }
+                }
+            }
+            "total_size" => cur.size = v.parse().ok(),
+            "progress" => {
+                cur.ended = v == "end";
+                done = Some(cur);
+            }
+            _ => {}
+        }
+    }
+    done
+}
+
+/// Tails the ffmpeg progress file while yt-dlp post-processes.
+struct PostWatch {
+    path: PathBuf,
+    span: Option<f64>,
+    /// File state when the current stage began; older reports are stale.
+    stale: Option<(u64, Option<SystemTime>)>,
+}
+
+impl PostWatch {
+    fn new(path: PathBuf, span: Option<f64>) -> Self {
+        Self {
+            path,
+            span,
+            stale: None,
+        }
+    }
+
+    fn stamp(&self) -> Option<(u64, Option<SystemTime>)> {
+        let meta = std::fs::metadata(&self.path).ok()?;
+        Some((meta.len(), meta.modified().ok()))
+    }
+
+    fn begin(&mut self) {
+        self.stale = self.stamp();
+    }
+
+    fn read(&self) -> Option<FfReport> {
+        let stamp = self.stamp()?;
+        if self.stale == Some(stamp) {
+            return None;
+        }
+        let mut file = std::fs::File::open(&self.path).ok()?;
+        file.seek(SeekFrom::Start(stamp.0.saturating_sub(4096))).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        parse_ff_report(&String::from_utf8_lossy(&bytes))
+    }
+
+    /// Current stage and its completion, from the newest report.
+    fn poll(&self, stage: Stage, input_bytes: u64) -> (Stage, Option<f64>) {
+        let Some(report) = self.read() else {
+            return (stage, None);
+        };
+        post_percent(&report, stage, self.span, input_bytes)
+    }
+}
+
+fn post_percent(
+    report: &FfReport,
+    stage: Stage,
+    span: Option<f64>,
+    input_bytes: u64,
+) -> (Stage, Option<f64>) {
+    let pct = match (report.out_secs, span) {
+        (Some(t), Some(span)) => Some(t / span * 100.0),
+        // Stream copy writes roughly what it reads.
+        _ if stage == Stage::Merge && input_bytes > 0 => report
+            .size
+            .map(|size| size as f64 / input_bytes as f64 * 100.0),
+        _ => None,
+    };
+    let pct = pct.map(|p| p.clamp(0.0, 100.0));
+    // Past the last frame ffmpeg still rewrites the file for +faststart, and
+    // yt-dlp then renames and cleans up. Neither reports progress.
+    if report.ended || pct.is_some_and(|p| p >= 99.5) {
+        return (Stage::Finalize, None);
+    }
+    (stage, pct)
 }
 
 fn parse_ffmpeg_clock(s: &str) -> Option<f64> {
@@ -1414,6 +1641,7 @@ fn parse_percent_progress(rest: &str) -> Option<Progress> {
         total,
         speed_bps,
         stage: Stage::Download,
+        post: None,
         filename: String::new(),
         downloaded,
         total_bytes,
@@ -1531,7 +1759,7 @@ mod tests {
             playlist: false,
             ffmpeg: Some(PathBuf::from("/opt/nitrate/tools/ffmpeg")),
         };
-        let args = build_ytdlp_args(&spec);
+        let args = build_ytdlp_args(&spec, None);
         let loc = args
             .windows(2)
             .find(|w| w[0] == "--ffmpeg-location")
@@ -1568,7 +1796,7 @@ mod tests {
             playlist: false,
             ffmpeg: None,
         };
-        let args = build_ytdlp_args(&spec);
+        let args = build_ytdlp_args(&spec, None);
         assert!(args.contains(&"--no-playlist".into()));
         assert!(!args.contains(&"--cookies-from-browser".into()));
         assert!(args.contains(&"--download-sections".into()));
@@ -1631,7 +1859,7 @@ mod tests {
             playlist: true,
             ffmpeg: None,
         };
-        let args = build_ytdlp_args(&spec);
+        let args = build_ytdlp_args(&spec, None);
         assert!(args.contains(&"--yes-playlist".into()));
         assert!(args.contains(&"-x".into()));
         assert!(args.contains(&"opus".into()));
@@ -1857,6 +2085,122 @@ mod tests {
         assert!(picked.0.ends_with("yt-dlp-glibc"), "{}", picked.0.display());
         assert!(picked.1.contains("2026.08.19"), "{}", picked.1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    fn spec_mp4() -> JobSpec {
+        JobSpec {
+            url: "https://youtu.be/x".into(),
+            mode: MediaMode::Video,
+            video_container: VideoContainer::Mp4,
+            audio_container: AudioContainer::Mp3,
+            video_quality: 0,
+            audio_quality: 0,
+            exact_format: None,
+            exact_has_audio: false,
+            exact_has_video: true,
+            trim_in: Some(60.0),
+            trim_out: None,
+            duration: Some(3600.0),
+            output_dir: PathBuf::from("/tmp/nitrate"),
+            playlist: false,
+            ffmpeg: None,
+        }
+    }
+
+    #[test]
+    fn post_processors_report_progress_to_file() {
+        let args = build_ytdlp_args(&spec_mp4(), Some(Path::new("/tmp/n it.progress")));
+        let ppa: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--postprocessor-args")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(ppa.contains(&"default:-progress 'file:/tmp/n it.progress'"), "{ppa:?}");
+        let merger = ppa.iter().find(|a| a.starts_with("Merger:")).expect("merger");
+        assert!(merger.contains("-c:a aac"), "{merger}");
+        assert!(merger.ends_with("-progress 'file:/tmp/n it.progress'"), "{merger}");
+        assert!(progress_arg(Path::new("/tmp/it's")).is_none());
+        assert!(!build_ytdlp_args(&spec_mp4(), None).iter().any(|a| a.contains("-progress '")));
+    }
+
+    #[test]
+    fn merger_line_enters_merge_stage_and_keeps_path() {
+        match interpret_line(r#"[Merger] Merging formats into "/v/a b.mp4""#) {
+            LineKind::StageDest(Stage::Merge, path) => assert_eq!(path, "/v/a b.mp4"),
+            other => panic!("{other:?}"),
+        }
+        match interpret_line("[ExtractAudio] Destination: /v/a.mp3") {
+            LineKind::StageDest(Stage::Convert, path) => assert_eq!(path, "/v/a.mp3"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn ff_report_uses_last_complete_block() {
+        let text = "out_time_us=1000000\ntotal_size=500\nprogress=continue\n\
+                    out_time_us=2500000\ntotal_size=900\nprogress=continue\n\
+                    out_time_us=9999";
+        let r = parse_ff_report(text).expect("block");
+        assert_eq!(r.out_secs, Some(2.5));
+        assert_eq!(r.size, Some(900));
+        assert!(!r.ended);
+        assert!(parse_ff_report("out_time_us=5").is_none());
+        let r = parse_ff_report("out_time_us=-9223372036854775807\ntotal_size=N/A\nprogress=end\n")
+            .expect("end");
+        assert_eq!(r.out_secs, None);
+        assert!(r.ended);
+    }
+
+    #[test]
+    fn post_percent_from_time_then_size_then_finishing() {
+        let span = output_span(&spec_mp4());
+        assert_eq!(span, Some(3540.0));
+        let at = |secs: f64| FfReport { out_secs: Some(secs), size: None, ended: false };
+        let (stage, pct) = post_percent(&at(1770.0), Stage::Merge, span, 0);
+        assert_eq!(stage, Stage::Merge);
+        assert!((pct.unwrap() - 50.0).abs() < 1e-9);
+
+        let by_size = FfReport { out_secs: None, size: Some(250), ended: false };
+        let (_, pct) = post_percent(&by_size, Stage::Merge, None, 1000);
+        assert!((pct.unwrap() - 25.0).abs() < 1e-9);
+        let (_, pct) = post_percent(&by_size, Stage::Convert, None, 1000);
+        assert_eq!(pct, None);
+
+        // Faststart rewrite after the last frame, and after ffmpeg exits.
+        assert_eq!(post_percent(&at(3539.0), Stage::Merge, span, 0), (Stage::Finalize, None));
+        let ended = FfReport { ended: true, ..at(3540.0) };
+        assert_eq!(post_percent(&ended, Stage::Merge, span, 0), (Stage::Finalize, None));
+    }
+
+    #[test]
+    fn post_watch_ignores_report_left_by_previous_ffmpeg_run() {
+        let path = std::env::temp_dir().join(format!("nitrate-test-{}.progress", std::process::id()));
+        std::fs::write(&path, "out_time_us=100000000\nprogress=end\n").unwrap();
+        let mut watch = PostWatch::new(path.clone(), Some(200.0));
+        watch.begin();
+        assert_eq!(watch.poll(Stage::Finalize, 0), (Stage::Finalize, None));
+        std::fs::write(&path, "out_time_us=50000000\nprogress=continue\n").unwrap();
+        let (stage, pct) = watch.poll(Stage::Finalize, 0);
+        assert_eq!(stage, Stage::Finalize);
+        assert!((pct.unwrap() - 25.0).abs() < 1e-9);
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    #[test]
+    fn postprocess_template_drives_steps_even_when_quiet() {
+        let args = build_ytdlp_args(&spec_mp4(), None);
+        assert!(args.iter().any(|a| a.starts_with("postprocess:NITRATE_PP:")), "{args:?}");
+        let stage = |line: &str| match interpret_line(line) {
+            LineKind::Stage(s) => s,
+            other => panic!("{line}: {other:?}"),
+        };
+        assert_eq!(stage("NITRATE_PP:started|Merger"), Stage::Merge);
+        assert_eq!(stage("NITRATE_PP:started|ExtractAudio"), Stage::Convert);
+        assert_eq!(stage("NITRATE_PP:started|FixupM3u8"), Stage::Finalize);
+        assert_eq!(stage("NITRATE_PP:finished|Merger"), Stage::Finalize);
+        assert_eq!(stage("NITRATE_PP:started|MoveFiles"), Stage::Finalize);
     }
 
 }

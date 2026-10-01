@@ -1,9 +1,9 @@
-use crate::effects::{self, Particle, Rng};
 use crate::engine::{
     self, AudioContainer, EngineEvent, JobResult, JobSpec, MediaMode, Progress, Stage, Tools,
     VideoContainer, VideoInfo, AUDIO_QUALITIES, VIDEO_QUALITIES,
 };
 use crate::ui;
+use crate::vhs::Deck;
 use crate::util::{self, detect_platform, format_timestamp, parse_timestamp, Field, Platform};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -85,18 +85,6 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Boot => "BOOT",
-            Self::Idle => "IDLE",
-            Self::Probing => "LOCKING",
-            Self::Ready => "ARMED",
-            Self::Extracting => "LIVE",
-            Self::Done => "LOCK",
-            Self::Failed => "FAULT",
-        }
-    }
-
     pub fn busy(self) -> bool {
         matches!(self, Self::Probing | Self::Extracting)
     }
@@ -148,13 +136,14 @@ pub struct App {
     pub logs: VecDeque<String>,
     pub history: Vec<HistoryItem>,
     pub progress: Progress,
+    /// When the current job stage (download, merge, ...) began.
+    pub stage_started: Instant,
     pub speed_hist: Vec<u64>,
     pub last_path: Option<PathBuf>,
     pub last_error: Option<String>,
-    pub particles: Vec<Particle>,
+    pub deck: Deck,
     pub hits: Hits,
     pub trim_drag: Option<TrimDrag>,
-    pub rng: Rng,
     pub update_available: Option<String>,
     pub apply_update: bool,
     tx: Sender<EngineEvent>,
@@ -195,25 +184,25 @@ impl App {
                 total: String::new(),
                 speed_bps: 0,
                 stage: Stage::Download,
+                post: None,
                 filename: String::new(),
                 downloaded: 0,
                 total_bytes: 0,
             },
+            stage_started: Instant::now(),
             speed_hist: Vec::new(),
             last_path: None,
             last_error: None,
-            particles: Vec::new(),
+            deck: Deck::default(),
             hits: Hits::default(),
             trim_drag: None,
-            rng: Rng::new(0x4E495452415445),
             update_available: None,
             apply_update: false,
             tx,
             rx,
             kill: None,
         };
-        app.log("NITRATE VIDEO EXTRACTION CONSOLE");
-        app.log("UNIT / VT-01   CLASS: UNRESTRICTED");
+        app.log("NITRATE VIDEO CASSETTE RECORDER");
         match &app.tools.ytdlp {
             Some((_, ver)) => app.log(format!("YT-DLP  {ver}")),
             None => app.log("YT-DLP  MISSING — install yt-dlp"),
@@ -222,7 +211,7 @@ impl App {
             Some((_, ver)) => app.log(format!("FFMPEG  {ver}")),
             None => app.log("FFMPEG  MISSING — merge/trim needs ffmpeg"),
         }
-        app.log("PASTE URL  ENTER LOCK  F6 EXTRACT  ? HELP");
+        app.log("PASTE A URL  ENTER LOAD  F6 REC  ? HELP");
         app
     }
 
@@ -275,13 +264,23 @@ impl App {
         if self.phase == Phase::Boot && self.started.elapsed() >= Duration::from_millis(2400) {
             self.phase = Phase::Idle;
         }
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: 240,
-            height: 80,
+        self.step_deck();
+    }
+
+    /// Drive the cassette transport from the job phase.
+    fn step_deck(&mut self) {
+        let (pos, speed) = match self.phase {
+            // All bytes are in; keep the reels turning while ffmpeg works.
+            Phase::Extracting if self.progress.stage.is_post() => (1.0, 0.6),
+            Phase::Extracting => (self.progress.percent / 100.0, 1.0),
+            // Cueing a fresh tape: rewind fast while metadata loads.
+            Phase::Probing => (0.0, -1.8),
+            Phase::Done => (1.0, 0.0),
+            Phase::Failed => (self.deck.pos, 0.0),
+            _ => (0.0, 0.0),
         };
-        effects::step_particles(&mut self.particles, bounds);
+        let loaded = !self.url.is_empty() || self.busy();
+        self.deck.step(pos, speed, loaded);
     }
 
     pub fn drain_engine(&mut self) {
@@ -289,6 +288,9 @@ impl App {
             match ev {
                 EngineEvent::Log(msg) => self.log(msg),
                 EngineEvent::Progress(p) => {
+                    if p.stage != self.progress.stage {
+                        self.stage_started = Instant::now();
+                    }
                     self.progress = p;
                     if self.progress.speed_bps > 0 {
                         self.speed_hist.push(self.progress.speed_bps);
@@ -302,7 +304,7 @@ impl App {
                     match result {
                         Ok(info) => {
                             self.log(format!(
-                                "LOCKED  {}  {}",
+                                "LOADED  {}  {}",
                                 info.platform.label(),
                                 info.title
                             ));
@@ -341,13 +343,6 @@ impl App {
                             if self.history.len() > 40 {
                                 self.history.pop();
                             }
-                            effects::spawn_sparks(
-                                &mut self.particles,
-                                &mut self.rng,
-                                60.0,
-                                18.0,
-                                28,
-                            );
                         }
                         Err(e) => {
                             self.last_error = Some(e.clone());
@@ -954,7 +949,7 @@ impl App {
         self.phase = Phase::Probing;
         self.last_error = None;
         self.progress.percent = 0.0;
-        self.log(format!("LOCKING  {url}"));
+        self.log(format!("TRACKING  {url}"));
         let ffmpeg = self.tools.ffmpeg.as_ref().map(|(p, _)| p.clone());
         engine::spawn_probe(bin, ffmpeg, url, self.playlist, kill, self.tx.clone());
     }
@@ -986,8 +981,12 @@ impl App {
         self.progress.percent = 0.0;
         self.progress.speed.clear();
         self.progress.eta.clear();
+        self.progress.total.clear();
+        self.progress.stage = Stage::Download;
+        self.progress.post = None;
+        self.stage_started = Instant::now();
         self.speed_hist.clear();
-        self.log("EXTRACT  START");
+        self.log("REC  START");
         let title = self
             .info
             .as_ref()
